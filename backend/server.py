@@ -13,10 +13,16 @@ import re
 import logging
 import asyncio
 import uuid
+import hashlib
+import hmac
+import html as html_lib
+import json
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Literal
+from urllib.parse import quote
 
 import bcrypt
 import httpx
@@ -25,10 +31,12 @@ import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Header, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Header, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field, field_validator
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -57,6 +65,14 @@ RESEND_FROM = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 # Base URL of the web app — used for clickable email links (custom app schemes
 # like remindly:// are not clickable in email clients). Override via env if needed.
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "https://www.rymind.in").rstrip("/")
+
+# Payments. Mobile purchases go through RevenueCat (App Store / Play billing);
+# web purchases go through Razorpay. Each side stays disabled until its keys are set.
+REVENUECAT_SECRET_KEY = os.environ.get("REVENUECAT_SECRET_KEY", "")
+REVENUECAT_WEBHOOK_AUTH = os.environ.get("REVENUECAT_WEBHOOK_AUTH", "")
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
 # ---------------- DB ----------------
 # Tuned pool + timeouts: keep warm connections (less churn / fewer dropped SYNs) and
@@ -139,6 +155,8 @@ class UserOut(BaseModel):
     phone_verified: bool = True
     email_verified: bool = True
     marketing_consent: bool = False
+    plan: str = "free"  # effective plan: free while the credit balance is empty
+    credits: float = 0
 
 
 class MarketingUnsubscribeIn(BaseModel):
@@ -435,7 +453,9 @@ async def send_sms(to_phone: str, body: str) -> bool:
 
         def _send():
             c = Client(TWILIO_SID, TWILIO_TOKEN)
-            c.messages.create(from_=TWILIO_PHONE, to=to_phone, body=body)
+            # smart_encoded swaps look-alike Unicode (curly quotes, long dashes) for GSM-7
+            # characters, so a typed apostrophe doesn't double the segment count.
+            c.messages.create(from_=TWILIO_PHONE, to=to_phone, body=body, smart_encoded=True)
 
         await asyncio.to_thread(_send)
         return True
@@ -466,6 +486,490 @@ async def send_email(to_email: str, subject: str, html: str) -> bool:
     except Exception as e:
         logger.warning("[email] failed: %s", e)
         return False
+
+
+# ---------------- Plans & credits ----------------
+# One-time credit packs from the client's plan sheet. Credits never expire.
+# 1 credit = $0.001 of provider cost; the pack prices carry the margin.
+# Balances are stored as integer tenths of a credit (credits_tenths) so 0.4-credit
+# emails add up exactly instead of drifting like floats would.
+FREE_ACTIVE_LIMIT = 10
+PAID_CHANNELS = ("whatsapp", "sms", "email")
+CREDIT_USD = 0.001
+
+PLANS: list[dict] = [
+    {
+        "id": "free", "name": "Free", "credits": 0, "price_usd": 0, "price_inr": 0,
+        "product_id": None, "recommended": False,
+        "tagline": "For individuals trying Rymind",
+        "features": ["App notifications only", f"Up to {FREE_ACTIVE_LIMIT} active reminders"],
+    },
+    {
+        "id": "starter", "name": "Starter", "credits": 1000, "price_usd": 5.99, "price_inr": 499,
+        "product_id": "rymind_credits_1000", "recommended": False,
+        "tagline": "Best for sending occasional reminders.",
+        "features": ["1,000 credits", "Notifications, WhatsApp, SMS and email", "Unlimited active reminders"],
+    },
+    {
+        "id": "popular", "name": "Popular", "credits": 4000, "price_usd": 19.99, "price_inr": 1699,
+        "product_id": "rymind_credits_4000", "recommended": True,
+        "tagline": "Best for regular personal use.",
+        "features": ["4,000 credits", "Notifications, WhatsApp, SMS and email", "Unlimited active reminders"],
+    },
+    {
+        "id": "business", "name": "Business", "credits": 20000, "price_usd": 89.99, "price_inr": 7499,
+        "product_id": "rymind_credits_20000", "recommended": False,
+        "tagline": "Best for businesses sending reminders to customers and teams.",
+        "features": ["20,000 credits", "Notifications, WhatsApp, SMS and email", "Unlimited active reminders"],
+    },
+]
+PACKS = {p["id"]: p for p in PLANS if p["credits"] > 0}
+PRODUCT_TO_PACK = {p["product_id"]: p["id"] for p in PACKS.values()}
+# Existing users at launch get the smallest pack once, as a welcome gift.
+WELCOME_GIFT_PACK = "starter"
+
+
+def _credits_tenths(u: dict) -> int:
+    return int(u.get("credits_tenths") or 0)
+
+
+def _tenths_to_credits(t: int) -> float:
+    return round(t / 10, 1)
+
+
+def _effective_plan(u: dict) -> str:
+    """A user is on Free whenever their balance is empty; otherwise they hold the
+    tier of the last pack they bought (or were gifted)."""
+    if _credits_tenths(u) <= 0:
+        return "free"
+    plan = u.get("plan")
+    return plan if plan in PACKS else WELCOME_GIFT_PACK
+
+
+def _billing_currency(u: dict) -> str:
+    """Web checkout charges Indian users in INR and everyone else in USD.
+    (App Store / Play localize prices themselves.)"""
+    return "INR" if (u.get("country_code") or "+91") == "+91" else "USD"
+
+
+# ---------------- Per-country message rates ----------------
+# Paid sends always go to the account holder's own phone/email (self reminders, and
+# the creator's copy of "someone else" reminders), so cost depends on the user's
+# own country. India is domestic and uses the sheet's fixed rates; every other
+# country is priced from that country's real provider cost.
+DOMESTIC_ISO = "IN"
+DOMESTIC_CREDITS = {"sms": 80, "whatsapp": 6}
+EMAIL_TENTHS = 4  # 0.4 credits, same everywhere
+# The sheet's flat international rates, used only for countries we can't price.
+INTL_DEFAULT_CREDITS = {"sms": 500, "whatsapp": 60}
+
+# (dial code, ISO country, display name). Longest dial-code prefix wins.
+COUNTRY_DIAL_CODES: list[tuple[str, str, str]] = [
+    ("+1", "US", "US & Canada"), ("+7", "RU", "Russia"), ("+20", "EG", "Egypt"),
+    ("+27", "ZA", "South Africa"), ("+30", "GR", "Greece"), ("+31", "NL", "Netherlands"),
+    ("+32", "BE", "Belgium"), ("+33", "FR", "France"), ("+34", "ES", "Spain"),
+    ("+36", "HU", "Hungary"), ("+39", "IT", "Italy"), ("+40", "RO", "Romania"),
+    ("+41", "CH", "Switzerland"), ("+43", "AT", "Austria"), ("+44", "GB", "United Kingdom"),
+    ("+45", "DK", "Denmark"), ("+46", "SE", "Sweden"), ("+47", "NO", "Norway"),
+    ("+48", "PL", "Poland"), ("+49", "DE", "Germany"), ("+51", "PE", "Peru"),
+    ("+52", "MX", "Mexico"), ("+54", "AR", "Argentina"), ("+55", "BR", "Brazil"),
+    ("+56", "CL", "Chile"), ("+57", "CO", "Colombia"), ("+58", "VE", "Venezuela"),
+    ("+60", "MY", "Malaysia"), ("+61", "AU", "Australia"), ("+62", "ID", "Indonesia"),
+    ("+63", "PH", "Philippines"), ("+64", "NZ", "New Zealand"), ("+65", "SG", "Singapore"),
+    ("+66", "TH", "Thailand"), ("+81", "JP", "Japan"), ("+82", "KR", "South Korea"),
+    ("+84", "VN", "Vietnam"), ("+86", "CN", "China"), ("+90", "TR", "Turkey"),
+    ("+91", "IN", "India"), ("+92", "PK", "Pakistan"), ("+93", "AF", "Afghanistan"),
+    ("+94", "LK", "Sri Lanka"), ("+95", "MM", "Myanmar"), ("+98", "IR", "Iran"),
+    ("+211", "SS", "South Sudan"), ("+212", "MA", "Morocco"), ("+213", "DZ", "Algeria"),
+    ("+216", "TN", "Tunisia"), ("+218", "LY", "Libya"), ("+220", "GM", "Gambia"),
+    ("+221", "SN", "Senegal"), ("+233", "GH", "Ghana"), ("+234", "NG", "Nigeria"),
+    ("+237", "CM", "Cameroon"), ("+250", "RW", "Rwanda"), ("+251", "ET", "Ethiopia"),
+    ("+254", "KE", "Kenya"), ("+255", "TZ", "Tanzania"), ("+256", "UG", "Uganda"),
+    ("+260", "ZM", "Zambia"), ("+263", "ZW", "Zimbabwe"), ("+351", "PT", "Portugal"),
+    ("+352", "LU", "Luxembourg"), ("+353", "IE", "Ireland"), ("+354", "IS", "Iceland"),
+    ("+356", "MT", "Malta"), ("+357", "CY", "Cyprus"), ("+358", "FI", "Finland"),
+    ("+359", "BG", "Bulgaria"), ("+370", "LT", "Lithuania"), ("+371", "LV", "Latvia"),
+    ("+372", "EE", "Estonia"), ("+380", "UA", "Ukraine"), ("+381", "RS", "Serbia"),
+    ("+385", "HR", "Croatia"), ("+386", "SI", "Slovenia"), ("+420", "CZ", "Czech Republic"),
+    ("+421", "SK", "Slovakia"), ("+852", "HK", "Hong Kong"), ("+853", "MO", "Macau"),
+    ("+855", "KH", "Cambodia"), ("+880", "BD", "Bangladesh"), ("+886", "TW", "Taiwan"),
+    ("+960", "MV", "Maldives"), ("+961", "LB", "Lebanon"), ("+962", "JO", "Jordan"),
+    ("+963", "SY", "Syria"), ("+964", "IQ", "Iraq"), ("+965", "KW", "Kuwait"),
+    ("+966", "SA", "Saudi Arabia"), ("+967", "YE", "Yemen"), ("+968", "OM", "Oman"),
+    ("+971", "AE", "United Arab Emirates"), ("+972", "IL", "Israel"), ("+973", "BH", "Bahrain"),
+    ("+974", "QA", "Qatar"), ("+975", "BT", "Bhutan"), ("+977", "NP", "Nepal"),
+    ("+994", "AZ", "Azerbaijan"), ("+995", "GE", "Georgia"), ("+998", "UZ", "Uzbekistan"),
+]
+_DIAL_CODES_LONGEST_FIRST = sorted(COUNTRY_DIAL_CODES, key=lambda c: len(c[0]), reverse=True)
+
+
+def _country_for_user(u: dict) -> tuple[Optional[str], str]:
+    """(ISO code, display name) of the user's own phone country, from the stored
+    country code (falling back to the full number)."""
+    for raw in (u.get("country_code"), u.get("phone_full")):
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if not s.startswith("+"):
+            s = "+" + s
+        for dial, iso, name in _DIAL_CODES_LONGEST_FIRST:
+            if s.startswith(dial):
+                return iso, name
+    return None, "Unknown country"
+
+
+# WhatsApp: Meta's per-message utility-template rate (USD) by market, plus Twilio's
+# per-message fee. Meta revises these on the 1st of a quarter; update this table
+# from the rate card (developers.facebook.com/docs/whatsapp/pricing) when it does.
+# The buffer absorbs small rate changes so we never charge below cost.
+WA_RATE_BUFFER = 1.25
+TWILIO_WA_FEE_USD = 0.005
+WA_MARKET_RATE_USD = {
+    "north_america": 0.0040, "AR": 0.0260, "BR": 0.0080, "CL": 0.0200, "CO": 0.0020,
+    "EG": 0.0052, "FR": 0.0300, "DE": 0.0550, "IN": 0.0014, "ID": 0.0250, "IL": 0.0053,
+    "IT": 0.0300, "MY": 0.0140, "MX": 0.0100, "NL": 0.0500, "NG": 0.0067, "PK": 0.0054,
+    "PE": 0.0200, "RU": 0.0400, "SA": 0.0115, "ZA": 0.0076, "ES": 0.0200, "TR": 0.0053,
+    "AE": 0.0157, "GB": 0.0220,
+    "rest_africa": 0.0040, "rest_apac": 0.0160, "rest_cee": 0.0212, "rest_latam": 0.0113,
+    "rest_me": 0.0091, "rest_we": 0.0300, "other": 0.0077,
+}
+_WA_REGIONS = {
+    "north_america": "US CA",
+    "rest_africa": "DZ AO BJ BW BF BI CM TD CG ER ET GA GM GH GW CI KE LS LR LY MG MW ML MR "
+                   "MZ NA NE RW SN SL SO SS SD SZ TZ TG TN UG ZM ZW",
+    "rest_apac": "AF AU KH CN JP LA MN NZ PG PH TW TJ TH TM UZ VN",
+    "rest_cee": "AL AM AZ BY BG HR CZ GE GR LV LT MD MK RS SK SI",
+    "rest_we": "AT BE DK FI IE NO PT SE CH",
+    "rest_latam": "BO CR DO EC SV GT HT HN JM NI PA PY PR UY VE",
+    "rest_me": "BH JO LB YE",
+}
+_WA_MARKET_BY_ISO = {iso: market for market, isos in _WA_REGIONS.items() for iso in isos.split()}
+
+
+def _whatsapp_usd_rate(iso: Optional[str]) -> float:
+    if not iso:
+        return INTL_DEFAULT_CREDITS["whatsapp"] * CREDIT_USD
+    market = iso if iso in WA_MARKET_RATE_USD else _WA_MARKET_BY_ISO.get(iso, "other")
+    return WA_MARKET_RATE_USD[market] * WA_RATE_BUFFER + TWILIO_WA_FEE_USD
+
+
+# SMS: live per-country price from Twilio's Pricing API (highest carrier price, so we
+# never undercharge), cached for a week. The table below is only a fallback for when
+# Twilio isn't reachable. US/Canada carrier fees are billed on top of Twilio's price.
+SMS_RATE_TTL = timedelta(days=7)
+SMS_CARRIER_FEE_USD = {"US": 0.005}
+SMS_FALLBACK_USD = {
+    "US": 0.0110, "GB": 0.0520, "AU": 0.0550, "AE": 0.0700, "SG": 0.0500, "DE": 0.0950,
+    "FR": 0.0850, "JP": 0.0800, "CN": 0.0500, "SA": 0.0600, "QA": 0.0550, "KW": 0.0700,
+    "OM": 0.0700, "BH": 0.0400, "NP": 0.1300, "BD": 0.3000, "PK": 0.3000, "LK": 0.2000,
+    "MY": 0.0700, "ID": 0.4000, "PH": 0.2000, "TH": 0.0400, "NZ": 0.1200, "ZA": 0.0400,
+    "NG": 0.3500, "KE": 0.2000, "IT": 0.0900, "ES": 0.0900, "NL": 0.1200, "IE": 0.0900,
+    "BR": 0.0500, "MX": 0.0400, "HK": 0.0700,
+}
+_sms_rate_cache: dict[str, tuple[float, datetime]] = {}
+
+
+async def _fetch_twilio_sms_price(iso: str) -> Optional[float]:
+    if not _twilio_ready():
+        return None
+    try:
+        from twilio.rest import Client  # type: ignore
+
+        def _get() -> Optional[float]:
+            country = Client(TWILIO_SID, TWILIO_TOKEN).pricing.v1.messaging.countries(iso).fetch()
+            prices: list[float] = []
+            for carrier in country.outbound_sms_prices or []:
+                for p in carrier.get("prices", []) or []:
+                    if p.get("number_type") == "shortcode":
+                        continue
+                    try:
+                        prices.append(float(p.get("current_price") or p.get("base_price")))
+                    except (TypeError, ValueError):
+                        pass
+            return max(prices) if prices else None
+
+        return await asyncio.wait_for(asyncio.to_thread(_get), timeout=8)
+    except Exception as e:
+        logger.warning("[rates] twilio pricing lookup failed for %s: %s", iso, e)
+        return None
+
+
+async def _sms_usd_rate(iso: Optional[str]) -> float:
+    if not iso:
+        return INTL_DEFAULT_CREDITS["sms"] * CREDIT_USD
+    now = datetime.now(timezone.utc)
+    hit = _sms_rate_cache.get(iso)
+    if hit and now - hit[1] < SMS_RATE_TTL:
+        return hit[0]
+    key = f"sms:{iso}"
+    doc = await db.channel_rates.find_one({"key": key}, {"_id": 0})
+    if doc and now - _parse_iso(doc["fetched_at"]) < SMS_RATE_TTL:
+        _sms_rate_cache[iso] = (doc["usd"], _parse_iso(doc["fetched_at"]))
+        return doc["usd"]
+    live = await _fetch_twilio_sms_price(iso)
+    if live is None:
+        # A stale stored price beats the static table; retry the live lookup in an hour.
+        usd = doc["usd"] if doc else SMS_FALLBACK_USD.get(iso, INTL_DEFAULT_CREDITS["sms"] * CREDIT_USD)
+        _sms_rate_cache[iso] = (usd, now - SMS_RATE_TTL + timedelta(hours=1))
+        return usd
+    usd = live + SMS_CARRIER_FEE_USD.get(iso, 0.0)
+    await db.channel_rates.update_one(
+        {"key": key},
+        {"$set": {"key": key, "usd": usd, "source": "twilio", "fetched_at": now.isoformat()}},
+        upsert=True,
+    )
+    _sms_rate_cache[iso] = (usd, now)
+    return usd
+
+
+def _usd_to_credits(usd: float) -> int:
+    return max(1, math.ceil(round(usd / CREDIT_USD, 6)))
+
+
+async def _channel_quote(u: dict, channel: str) -> dict:
+    """What one message on `channel` costs this user, plus how it's categorised
+    in the transaction history."""
+    if channel == "email":
+        return {"tenths": EMAIL_TENTHS, "category": None, "country_iso": None, "country_name": None}
+    iso, name = _country_for_user(u)
+    if iso == DOMESTIC_ISO:
+        credits = DOMESTIC_CREDITS[channel]
+        category = "domestic"
+    else:
+        usd = await _sms_usd_rate(iso) if channel == "sms" else _whatsapp_usd_rate(iso)
+        credits = _usd_to_credits(usd)
+        category = "international"
+    return {"tenths": credits * 10, "category": category, "country_iso": iso, "country_name": name}
+
+
+async def _rates_for_user(u: dict) -> dict:
+    iso, name = _country_for_user(u)
+    sms = await _channel_quote(u, "sms")
+    wa = await _channel_quote(u, "whatsapp")
+    return {
+        "country_iso": iso,
+        "country_name": name,
+        "category": "domestic" if iso == DOMESTIC_ISO else "international",
+        "push": 0,
+        "whatsapp": _tenths_to_credits(wa["tenths"]),
+        "sms": _tenths_to_credits(sms["tenths"]),
+        "email": _tenths_to_credits(EMAIL_TENTHS),
+    }
+
+
+# ---------------- Credit ledger ----------------
+async def _broadcast_billing(user_id: str) -> None:
+    try:
+        u = await db.users.find_one({"id": user_id}, {"_id": 0, "credits_tenths": 1, "plan": 1})
+        if u:
+            await broadcast_to_user(user_id, {
+                "type": "billing.updated",
+                "data": {"plan": _effective_plan(u), "credits": _tenths_to_credits(_credits_tenths(u))},
+            })
+    except Exception as e:
+        logger.debug("[ws] broadcast billing.updated failed: %s", e)
+
+
+async def _grant_credits(
+    user_id: str,
+    tenths: int,
+    *,
+    kind: str,
+    key: str,
+    pack_id: Optional[str] = None,
+    note: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> bool:
+    """Add credits exactly once per idempotency key. Returns False if this key was
+    already applied (a webhook retry, or the app and the webhook both reporting
+    the same purchase)."""
+    now = datetime.now(timezone.utc).isoformat()
+    entry_id = str(uuid.uuid4())
+    try:
+        await db.credit_ledger.insert_one({
+            "id": entry_id,
+            "user_id": user_id,
+            "kind": kind,  # purchase | gift | admin | refund
+            "delta_tenths": tenths,
+            "balance_after_tenths": None,
+            "pack_id": pack_id,
+            "provider": provider,
+            "note": note,
+            "idempotency_key": key,
+            "created_at": now,
+        })
+    except DuplicateKeyError:
+        return False
+    sets: dict = {"credits_exhausted_notified": False}
+    if pack_id in PACKS and tenths > 0:
+        sets.update({"plan": pack_id, "plan_updated_at": now})
+    u = await db.users.find_one_and_update(
+        {"id": user_id},
+        {"$inc": {"credits_tenths": tenths}, "$set": sets},
+        projection={"_id": 0, "credits_tenths": 1},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not u:
+        await db.credit_ledger.delete_one({"id": entry_id})
+        logger.warning("[credits] grant for missing user %s (key=%s)", user_id, key)
+        return False
+    await db.credit_ledger.update_one(
+        {"id": entry_id}, {"$set": {"balance_after_tenths": _credits_tenths(u)}}
+    )
+    await _broadcast_billing(user_id)
+    return True
+
+
+async def _send_paid(
+    user: dict,
+    reminder: dict,
+    occurrence: int,
+    channel: str,
+    role: str,
+    send,
+) -> str:
+    """Deliver one paid message and charge for it.
+
+    Credits are reserved atomically before the send (so two reminders firing at
+    once can't overdraw), refunded if the provider rejects the message, and only
+    recorded once Twilio/Resend has accepted it. The idempotency key ties the
+    charge to this reminder occurrence, so a re-run of the same occurrence (e.g.
+    after a restart mid-fire) neither re-sends nor re-charges.
+
+    Returns "sent", "no_credits", "failed" or "duplicate".
+    """
+    key = f"use:{reminder['id']}:{occurrence}:{channel}:{role}"
+    if await db.credit_ledger.find_one({"idempotency_key": key}, {"_id": 1}):
+        return "duplicate"
+    quote = await _channel_quote(user, channel)
+    cost = quote["tenths"]
+    reserved = await db.users.find_one_and_update(
+        {"id": user["id"], "credits_tenths": {"$gte": cost}},
+        {"$inc": {"credits_tenths": -cost}},
+        projection={"_id": 0, "credits_tenths": 1},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not reserved:
+        return "no_credits"
+    try:
+        ok = await send()
+    except Exception as e:
+        logger.warning("[credits] %s send raised: %s", channel, e)
+        ok = False
+    if not ok:
+        await db.users.update_one({"id": user["id"]}, {"$inc": {"credits_tenths": cost}})
+        return "failed"
+    try:
+        await db.credit_ledger.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "kind": "usage",
+            "delta_tenths": -cost,
+            "balance_after_tenths": _credits_tenths(reserved),
+            "channel": channel,
+            "role": role,  # self | creator (copy of a reminder for someone else)
+            "category": quote["category"],
+            "country_iso": quote["country_iso"],
+            "country_name": quote["country_name"],
+            "reminder_id": reminder["id"],
+            "reminder_title": reminder.get("title"),
+            "target_name": None if role == "self" else (reminder.get("target") or {}).get("name"),
+            "idempotency_key": key,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except DuplicateKeyError:
+        await db.users.update_one({"id": user["id"]}, {"$inc": {"credits_tenths": cost}})
+        return "duplicate"
+    return "sent"
+
+
+def _branded_email_html(heading: Optional[str], body_html: str, cta_label: Optional[str] = None,
+                        cta_url: Optional[str] = None, footer_html: str = "") -> str:
+    """The Rymind email shell used for system and admin emails."""
+    title = (
+        f'<h1 style="font-size:22px;color:#1B1F1A;margin:18px 0 12px;letter-spacing:-0.4px;line-height:1.3">'
+        f'{html_lib.escape(heading)}</h1>'
+        if heading else '<div style="height:18px"></div>'
+    )
+    cta = ""
+    if cta_label and cta_url:
+        cta = (
+            f'<a href="{html_lib.escape(cta_url, quote=True)}" style="display:inline-block;background:#2A4B41;'
+            f'color:#fff;text-decoration:none;font-weight:600;font-size:15px;padding:12px 22px;'
+            f'border-radius:999px;margin-top:8px">{html_lib.escape(cta_label)}</a>'
+        )
+    return f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:560px;margin:0 auto;background:#F8F9F7;padding:32px 16px">
+      <div style="background:#fff;border-radius:16px;padding:32px;border:1px solid #E5E7E0">
+        <div style="font-size:15px;font-weight:800;color:#2A4B41;letter-spacing:-0.2px">Rymind</div>
+        {title}
+        <div style="color:#4A5147;font-size:15px;line-height:1.6">{body_html}</div>
+        {cta}
+      </div>
+      <div style="color:#94978F;font-size:11px;margin-top:18px;text-align:center;line-height:1.6">{footer_html}</div>
+    </div>
+    """.strip()
+
+
+async def _notify_credits_exhausted(user_id: str) -> None:
+    """Tell the user once per run-out that paid channels are paused. The flag resets
+    on the next top-up, so they hear about it again only after recharging and
+    running out again."""
+    u = await db.users.find_one_and_update(
+        {"id": user_id, "credits_exhausted_notified": {"$ne": True}},
+        {"$set": {"credits_exhausted_notified": True,
+                  "credits_exhausted_at": datetime.now(timezone.utc).isoformat()}},
+        projection={"_id": 0, "expo_push_token": 1, "email": 1, "full_name": 1},
+    )
+    if not u:
+        return
+    if u.get("expo_push_token"):
+        await send_expo_push(
+            u["expo_push_token"],
+            "Your Rymind credits have run out",
+            "WhatsApp, SMS and email reminders are paused. Recharge to turn them back on. App notifications keep working.",
+            {"type": "credits_exhausted"},
+        )
+    if u.get("email"):
+        first = html_lib.escape((u.get("full_name") or "there").split(" ")[0])
+        body = (
+            f"<p style=\"margin:0 0 14px\">Hi {first},</p>"
+            "<p style=\"margin:0 0 14px\">You've used all your Rymind credits, so reminders on "
+            "WhatsApp, SMS and email are paused for now. App notifications keep working as usual.</p>"
+            "<p style=\"margin:0 0 18px\">Buy a credit pack in the Rymind app or on the web and your "
+            "reminders go back to every channel you picked. Credits never expire.</p>"
+        )
+        await send_email(
+            u["email"],
+            "Your Rymind credits have run out",
+            _branded_email_html("Your credits have run out", body, "Buy credits", f"{WEB_APP_URL}/web/plans",
+                                "You're receiving this because you have a Rymind account."),
+        )
+    await _broadcast_billing(user_id)
+
+
+async def _enforce_plan_limits(user: dict, channels: List[str], *, new_reminder: bool,
+                               existing_channels: Optional[List[str]] = None) -> None:
+    """Free plan = app notifications only and at most FREE_ACTIVE_LIMIT active reminders.
+    Edits to an existing reminder only block channels that weren't already on it."""
+    if _effective_plan(user) != "free":
+        return
+    already = set(existing_channels or [])
+    if any(c in PAID_CHANNELS and c not in already for c in channels):
+        raise HTTPException(
+            402,
+            "WhatsApp, SMS and email need credits. Buy a credit pack to use them, or pick App Notification.",
+        )
+    if new_reminder:
+        active = await db.reminders.count_documents(
+            {"user_id": user["id"], "status": {"$in": ["pending", "active"]}}
+        )
+        if active >= FREE_ACTIVE_LIMIT:
+            raise HTTPException(
+                402,
+                f"The Free plan includes up to {FREE_ACTIVE_LIMIT} active reminders. Complete or delete "
+                "one, or buy a credit pack for unlimited reminders.",
+            )
 
 
 # ---------------- Scheduling core ----------------
@@ -625,9 +1129,26 @@ async def _fire_reminder(reminder_id: str) -> None:
     </div>
     """.strip()
 
+    # SMS stays plain GSM-7 (no emoji, no middle dot) so a reminder bills as one segment.
+    sms_when = fired_local.strftime("%a, %d %b %Y, %I:%M %p")
     wa_body = f"*⏰ {title}*\n{msg}\n\n_Triggered: {when_str}_"
-    sms_body = f"⏰ {title}: {msg} ({when_str})"
+    sms_body = f"{title}: {msg} ({sms_when})"
     email_html = _email_html(msg, "You created this reminder for yourself.")
+
+    # Every server-sent WhatsApp/SMS/email is paid for from the creator's credits.
+    # Manual sends to "someone else" go from the creator's own phone and cost nothing.
+    occurrence = r.get("triggered_count", 0)
+    skipped_no_credits: list[str] = []
+    charged_any = False
+
+    async def _paid(ch: str, role: str, send) -> bool:
+        nonlocal charged_any
+        outcome = await _send_paid(user, r, occurrence, ch, role, send)
+        if outcome == "no_credits":
+            skipped_no_credits.append(ch)
+        elif outcome == "sent":
+            charged_any = True
+        return outcome in ("sent", "duplicate")
 
     for ch in ("whatsapp", "sms", "email"):
         if ch not in channels:
@@ -636,15 +1157,15 @@ async def _fire_reminder(reminder_id: str) -> None:
             try:
                 if ch == "whatsapp" and user.get("phone_full"):
                     # Pass template variables; send_whatsapp will use Content SID if configured
-                    results[ch] = await send_whatsapp(
+                    results[ch] = await _paid(ch, "self", lambda: send_whatsapp(
                         user["phone_full"],
                         wa_body,
                         template_vars={"1": title, "2": msg, "3": when_str},
-                    )
+                    ))
                 elif ch == "sms" and user.get("phone_full"):
-                    results[ch] = await send_sms(user["phone_full"], sms_body)
+                    results[ch] = await _paid(ch, "self", lambda: send_sms(user["phone_full"], sms_body))
                 elif ch == "email" and user.get("email"):
-                    results[ch] = await send_email(user["email"], f"⏰ {title}", email_html)
+                    results[ch] = await _paid(ch, "self", lambda: send_email(user["email"], f"⏰ {title}", email_html))
                 else:
                     results[ch] = False
                     logger.warning("[fire] self %s skipped: missing user contact for %s", ch, user.get("id"))
@@ -660,27 +1181,41 @@ async def _fire_reminder(reminder_id: str) -> None:
             creator_msg = f"(For {t_name}) {msg}"
             try:
                 if ch == "whatsapp" and user.get("phone_full"):
-                    results[f"{ch}_creator"] = await send_whatsapp(
+                    results[f"{ch}_creator"] = await _paid(ch, "creator", lambda: send_whatsapp(
                         user["phone_full"],
                         f"*⏰ {title}*\n{creator_msg}\n\n_Triggered: {when_str}_",
                         template_vars={"1": title, "2": creator_msg, "3": when_str},
-                    )
+                    ))
                 elif ch == "sms" and user.get("phone_full"):
-                    results[f"{ch}_creator"] = await send_sms(
-                        user["phone_full"], f"⏰ {title}: {creator_msg} ({when_str})"
-                    )
+                    results[f"{ch}_creator"] = await _paid(ch, "creator", lambda: send_sms(
+                        user["phone_full"], f"{title}: {creator_msg} ({sms_when})"
+                    ))
                 elif ch == "email" and user.get("email"):
-                    results[f"{ch}_creator"] = await send_email(
+                    results[f"{ch}_creator"] = await _paid(ch, "creator", lambda: send_email(
                         user["email"],
                         f"⏰ {title}",
                         _email_html(creator_msg, f"You created this reminder for {t_name}."),
-                    )
+                    ))
                 else:
                     results[f"{ch}_creator"] = False
                     logger.warning("[fire] creator copy %s skipped: missing contact for %s", ch, user.get("id"))
             except Exception as e:
                 results[f"{ch}_creator"] = False
                 logger.warning("[fire] creator copy %s exception: %s", ch, e)
+
+    if skipped_no_credits:
+        results["skipped_no_credits"] = skipped_no_credits
+    try:
+        if skipped_no_credits:
+            await _notify_credits_exhausted(user["id"])
+        elif charged_any:
+            fresh_user = await db.users.find_one({"id": user["id"]}, {"_id": 0, "credits_tenths": 1})
+            if fresh_user and _credits_tenths(fresh_user) <= 0:
+                await _notify_credits_exhausted(user["id"])
+            else:
+                await _broadcast_billing(user["id"])
+    except Exception as e:
+        logger.warning("[fire] credit notice failed for %s: %s", user.get("id"), e)
 
     now = datetime.now(timezone.utc).isoformat()
     new_triggered = r.get("triggered_count", 0) + 1
@@ -737,6 +1272,38 @@ async def _fire_reminder(reminder_id: str) -> None:
         logger.debug("[ws] broadcast reminder.fired failed: %s", e)
 
 
+async def _migrate_existing_users_to_credits() -> None:
+    """One-time switch to plans: every account that predates billing starts on Free
+    and receives the smallest pack once as a welcome gift. New signups get
+    credits_tenths=0 at creation, so they never match this query. The ledger key
+    makes the gift impossible to grant twice, even across restarts."""
+    legacy_ids = [
+        u["id"] async for u in db.users.find({"credits_tenths": {"$exists": False}}, {"_id": 0, "id": 1})
+    ]
+    if not legacy_ids:
+        return
+    await db.users.update_many(
+        {"id": {"$in": legacy_ids}, "credits_tenths": {"$exists": False}},
+        {"$set": {"credits_tenths": 0, "plan": "free", "credits_exhausted_notified": False}},
+    )
+    gift = PACKS[WELCOME_GIFT_PACK]
+    granted = 0
+    for uid in legacy_ids:
+        if await _grant_credits(
+            uid,
+            gift["credits"] * 10,
+            kind="gift",
+            key=f"gift:welcome:{uid}",
+            pack_id=WELCOME_GIFT_PACK,
+            note="Welcome gift",
+        ):
+            await db.users.update_one(
+                {"id": uid}, {"$set": {"welcome_gift_at": datetime.now(timezone.utc).isoformat()}}
+            )
+            granted += 1
+    logger.info("[credits] migrated %d existing users, welcome gift granted to %d", len(legacy_ids), granted)
+
+
 # ---------------- Lifespan ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -752,6 +1319,15 @@ async def lifespan(app: FastAPI):
         suffix = _phone_suffix(u.get("phone_full") or u.get("phone"))
         if suffix:
             await db.users.update_one({"id": u["id"]}, {"$set": {"phone_suffix": suffix}})
+    # Billing collections
+    await db.credit_ledger.create_index("idempotency_key", unique=True)
+    await db.credit_ledger.create_index([("user_id", 1), ("created_at", -1)])
+    await db.payments.create_index([("provider", 1), ("provider_ref", 1)], unique=True)
+    await db.channel_rates.create_index("key", unique=True)
+    await db.email_campaigns.create_index("created_at")
+    # A restart kills any in-flight broadcast; mark it so it doesn't block new sends.
+    await db.email_campaigns.update_many({"status": "sending"}, {"$set": {"status": "interrupted"}})
+    await _migrate_existing_users_to_credits()
     scheduler.start()
     # reschedule all active reminders
     async for r in db.reminders.find({"status": {"$in": ["pending", "active"]}}, {"_id": 0}):
@@ -793,6 +1369,8 @@ def _user_to_out(u: dict) -> UserOut:
         phone_verified=u.get("phone_verified", True),
         email_verified=u.get("email_verified", True),
         marketing_consent=u.get("marketing_consent", False),
+        plan=_effective_plan(u),
+        credits=_tenths_to_credits(_credits_tenths(u)),
     )
 
 
@@ -1078,6 +1656,10 @@ async def signup(payload: UserSignup):
         "marketing_consent": bool(payload.marketing_consent),
         "marketing_consent_at": now if payload.marketing_consent else None,
         "marketing_unsubscribed_at": None,
+        # New accounts start on the Free plan with no credits.
+        "plan": "free",
+        "credits_tenths": 0,
+        "credits_exhausted_notified": False,
     }
     await db.users.insert_one(doc)
     token = create_access_token(user_id)
@@ -1238,6 +1820,9 @@ async def delete_account(current=Depends(get_current_user)):
     del_codes = await db.verification_codes.delete_many(
         {"$or": [{"value": current.get("email", "")}, {"value": current.get("phone_full", "")}]}
     )
+    # Credit history goes with the account. Payment records are kept (no personal
+    # details, just the user id) because purchases must stay on file for accounting.
+    await db.credit_ledger.delete_many({"user_id": uid})
 
     # 3. Delete the user record itself
     await db.users.delete_one({"id": uid})
@@ -1281,6 +1866,7 @@ async def create_reminder(payload: ReminderCreate, current=Depends(get_current_u
         _parse_iso(payload.scheduled_at)
     except Exception:
         raise HTTPException(400, "Please pick a valid date and time.")
+    await _enforce_plan_limits(current, list(payload.channels), new_reminder=True)
     rid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     doc = {
@@ -1426,6 +2012,10 @@ async def update_reminder(rid: str, body: ReminderUpdate, current=Depends(get_cu
     updates = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
     if "scheduled_at" in updates:
         _parse_iso(updates["scheduled_at"])  # validate
+    if "channels" in updates:
+        await _enforce_plan_limits(
+            current, updates["channels"], new_reminder=False, existing_channels=r.get("channels", [])
+        )
     if updates:
         await db.reminders.update_one({"id": rid}, {"$set": updates})
     fresh = await db.reminders.find_one({"id": rid}, {"_id": 0})
@@ -1813,6 +2403,393 @@ async def ws_web_session(websocket: WebSocket, session_id: str):
             pass
 
 
+# ------- Billing: plans, credits & payments -------
+class RazorpayOrderIn(BaseModel):
+    pack_id: Literal["starter", "popular", "business"]
+
+
+class RazorpayVerifyIn(BaseModel):
+    razorpay_order_id: str = Field(..., min_length=1, max_length=64)
+    razorpay_payment_id: str = Field(..., min_length=1, max_length=64)
+    razorpay_signature: str = Field(..., min_length=1, max_length=256)
+
+
+def _format_price(amount: float, currency: str) -> str:
+    if not amount:
+        return "Free"
+    if currency == "INR":
+        return f"₹{amount:,.0f}"
+    return f"${amount:,.2f}"
+
+
+def _plan_catalog(u: dict) -> list[dict]:
+    currency = _billing_currency(u)
+    out = []
+    for p in PLANS:
+        price = p["price_inr"] if currency == "INR" else p["price_usd"]
+        out.append({
+            "id": p["id"],
+            "name": p["name"],
+            "credits": p["credits"],
+            "tagline": p["tagline"],
+            "features": p["features"],
+            "recommended": p["recommended"],
+            "product_id": p["product_id"],
+            "price": price,
+            "currency": currency,
+            "display_price": _format_price(price, currency),
+        })
+    return out
+
+
+def _billing_summary(u: dict) -> dict:
+    return {"plan": _effective_plan(u), "credits": _tenths_to_credits(_credits_tenths(u))}
+
+
+def _ledger_out(d: dict) -> dict:
+    pack = PACKS.get(d.get("pack_id") or "")
+    return {
+        "id": d["id"],
+        "kind": d.get("kind"),
+        "credits": _tenths_to_credits(int(d.get("delta_tenths") or 0)),
+        "balance_after": None if d.get("balance_after_tenths") is None
+        else _tenths_to_credits(int(d["balance_after_tenths"])),
+        "channel": d.get("channel"),
+        "role": d.get("role"),
+        "category": d.get("category"),
+        "country_name": d.get("country_name"),
+        "reminder_id": d.get("reminder_id"),
+        "reminder_title": d.get("reminder_title"),
+        "target_name": d.get("target_name"),
+        "pack_id": d.get("pack_id"),
+        "pack_name": pack["name"] if pack else None,
+        "provider": d.get("provider"),
+        "note": d.get("note"),
+        "created_at": d.get("created_at"),
+    }
+
+
+@api.get("/billing/me")
+async def billing_me(current=Depends(get_current_user)):
+    """Everything the Plans screen needs: current plan, balance, catalog in the user's
+    checkout currency, and what each channel costs for their country."""
+    active_q = {"user_id": current["id"], "status": {"$in": ["pending", "active"]}}
+    active, paid_channel_reminders = await asyncio.gather(
+        db.reminders.count_documents(active_q),
+        db.reminders.count_documents({**active_q, "channels": {"$in": list(PAID_CHANNELS)}}),
+    )
+    return {
+        **_billing_summary(current),
+        "last_pack": current.get("plan") if current.get("plan") in PACKS else None,
+        "active_reminders": active,
+        "paid_channel_reminders": paid_channel_reminders,
+        "free_active_limit": FREE_ACTIVE_LIMIT,
+        "currency": _billing_currency(current),
+        "plans": _plan_catalog(current),
+        "rates": await _rates_for_user(current),
+        "welcome_gift": bool(current.get("welcome_gift_at")),
+        "welcome_gift_credits": PACKS[WELCOME_GIFT_PACK]["credits"],
+        "web_checkout": bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET),
+    }
+
+
+@api.get("/billing/history")
+async def billing_history(limit: int = 50, before: Optional[str] = None, current=Depends(get_current_user)):
+    """Credit transactions, newest first. Page with ?before=<created_at of the last item>."""
+    limit = max(1, min(limit, 100))
+    q: dict = {"user_id": current["id"]}
+    if before:
+        q["created_at"] = {"$lt": before}
+    docs = await db.credit_ledger.find(q, {"_id": 0, "idempotency_key": 0}).sort(
+        "created_at", -1
+    ).limit(limit).to_list(limit)
+    return {
+        "items": [_ledger_out(d) for d in docs],
+        "next_before": docs[-1]["created_at"] if len(docs) == limit else None,
+    }
+
+
+async def _credit_purchase(
+    user_id: str,
+    pack_id: str,
+    *,
+    provider: str,
+    ref: str,
+    amount: Optional[float] = None,
+    currency: Optional[str] = None,
+    store: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> bool:
+    """Credit a paid pack once per provider transaction and record the payment."""
+    pack = PACKS[pack_id]
+    granted = await _grant_credits(
+        user_id,
+        pack["credits"] * 10,
+        kind="purchase",
+        key=f"pay:{provider}:{ref}",
+        pack_id=pack_id,
+        provider=provider,
+        note=f"{pack['name']} pack",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    sets = {"user_id": user_id, "pack_id": pack_id, "credits": pack["credits"], "status": "paid"}
+    for k, v in (("amount", amount), ("currency", currency), ("store", store), ("environment", environment)):
+        if v is not None:
+            sets[k] = v
+    if granted:
+        sets["paid_at"] = now
+    await db.payments.update_one(
+        {"provider": provider, "provider_ref": ref},
+        {"$set": sets, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}},
+        upsert=True,
+    )
+    return granted
+
+
+async def _refund_purchase(provider: str, ref: str) -> None:
+    """Take back a refunded pack's credits (never below zero) and mark the payment."""
+    pay = await db.payments.find_one({"provider": provider, "provider_ref": ref}, {"_id": 0})
+    if not pay or pay.get("status") != "paid":
+        return
+    pack = PACKS.get(pay.get("pack_id") or "")
+    u = await db.users.find_one({"id": pay["user_id"]}, {"_id": 0, "credits_tenths": 1})
+    if pack and u:
+        take = min(_credits_tenths(u), pack["credits"] * 10)
+        if take > 0:
+            await _grant_credits(
+                pay["user_id"], -take, kind="refund", key=f"refund:{provider}:{ref}",
+                provider=provider, note=f"{pack['name']} pack refunded",
+            )
+    await db.payments.update_one(
+        {"provider": provider, "provider_ref": ref},
+        {"$set": {"status": "refunded", "refunded_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+
+# --- Mobile: App Store / Google Play via RevenueCat ---
+async def _resolve_revenuecat_user(ev: dict) -> Optional[str]:
+    """The app logs in to RevenueCat with our user id, so app_user_id (or one of its
+    aliases, for a purchase made before login finished) is a Rymind user id."""
+    candidates = [ev.get("app_user_id"), ev.get("original_app_user_id"), *(ev.get("aliases") or [])]
+    for c in candidates:
+        if c and not str(c).startswith("$RCAnonymousID"):
+            u = await db.users.find_one({"id": str(c)}, {"_id": 0, "id": 1})
+            if u:
+                return u["id"]
+    return None
+
+
+@api.post("/billing/revenuecat/webhook")
+async def revenuecat_webhook(request: Request, authorization: Optional[str] = Header(None)):
+    """RevenueCat calls this for every store purchase/refund. Authenticated by the
+    shared secret set as the webhook's Authorization header in RevenueCat."""
+    if not REVENUECAT_WEBHOOK_AUTH:
+        raise HTTPException(503, "RevenueCat webhook is not configured.")
+    supplied = (authorization or "").strip()
+    if not (hmac.compare_digest(supplied, REVENUECAT_WEBHOOK_AUTH)
+            or hmac.compare_digest(supplied, f"Bearer {REVENUECAT_WEBHOOK_AUTH}")):
+        raise HTTPException(401, "Unauthorized")
+    payload = await request.json()
+    ev = payload.get("event") or {}
+    etype = ev.get("type")
+    pack_id = PRODUCT_TO_PACK.get(ev.get("product_id") or "")
+    txn = ev.get("transaction_id")
+    if not pack_id or not txn:
+        return {"ok": True, "ignored": etype}
+    if etype == "NON_RENEWING_PURCHASE":
+        uid = await _resolve_revenuecat_user(ev)
+        if not uid:
+            logger.warning("[revenuecat] purchase %s for unknown user %s", txn, ev.get("app_user_id"))
+            return {"ok": True, "ignored": "unknown_user"}
+        await _credit_purchase(
+            uid, pack_id, provider="revenuecat", ref=str(txn),
+            amount=ev.get("price_in_purchased_currency"), currency=ev.get("currency"),
+            store=ev.get("store"), environment=ev.get("environment"),
+        )
+    elif etype == "CANCELLATION":
+        # For one-time purchases a cancellation means the store refunded it.
+        await _refund_purchase("revenuecat", str(txn))
+    return {"ok": True}
+
+
+@api.post("/billing/revenuecat/sync")
+async def revenuecat_sync(current=Depends(get_current_user)):
+    """Called by the app right after a purchase so credits show up instantly instead
+    of waiting for the webhook. Safe to call any time: it only credits store
+    transactions that haven't been credited yet."""
+    if not REVENUECAT_SECRET_KEY:
+        raise HTTPException(503, "In-app purchases aren't set up on the server yet.")
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(
+                f"https://api.revenuecat.com/v1/subscribers/{quote(current['id'], safe='')}",
+                headers={"Authorization": f"Bearer {REVENUECAT_SECRET_KEY}"},
+            )
+    except Exception as e:
+        logger.warning("[revenuecat] sync request failed: %s", e)
+        resp = None
+    if resp is None or resp.status_code != 200:
+        raise HTTPException(502, "Your purchase went through. Credits will appear in a minute or two.")
+    non_subs = ((resp.json() or {}).get("subscriber") or {}).get("non_subscriptions") or {}
+    credited = 0
+    for product_id, txns in non_subs.items():
+        pack_id = PRODUCT_TO_PACK.get(product_id)
+        if not pack_id:
+            continue
+        for t in txns or []:
+            ref = t.get("store_transaction_id")
+            if not ref:
+                continue  # the webhook keys on the store id; never credit under a different key
+            if await _credit_purchase(
+                current["id"], pack_id, provider="revenuecat", ref=str(ref), store=t.get("store"),
+                environment="SANDBOX" if t.get("is_sandbox") else "PRODUCTION",
+            ):
+                credited += 1
+    fresh = await db.users.find_one({"id": current["id"]}, {"_id": 0})
+    return {"credited": credited, **_billing_summary(fresh or current)}
+
+
+# --- Web: Razorpay checkout ---
+def _razorpay_ready() -> bool:
+    return bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+
+
+async def _razorpay(method: str, path: str, body: Optional[dict] = None) -> dict:
+    async with httpx.AsyncClient(timeout=15, auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) as http:
+        resp = await http.request(method, f"https://api.razorpay.com/v1{path}", json=body)
+    if resp.status_code >= 400:
+        logger.warning("[razorpay] %s %s -> %s %s", method, path, resp.status_code, resp.text[:300])
+        raise HTTPException(502, "The payment service didn't respond as expected. Please try again.")
+    return resp.json()
+
+
+async def _settle_razorpay_order(order_id: str, payment: dict) -> bool:
+    """Credit an order once its payment is captured. Shared by the checkout callback
+    and the webhook, so whichever arrives first credits and the other is a no-op."""
+    pay_doc = await db.payments.find_one({"provider": "razorpay", "provider_ref": order_id}, {"_id": 0})
+    if not pay_doc or payment.get("order_id") != order_id:
+        return False
+    if int(payment.get("amount") or 0) != int(pay_doc["amount_minor"]) or payment.get("currency") != pay_doc["currency"]:
+        logger.warning("[razorpay] amount mismatch on order %s", order_id)
+        return False
+    if payment.get("status") == "authorized":
+        # Accounts without auto-capture leave payments authorized; capture now.
+        try:
+            payment = await _razorpay("POST", f"/payments/{payment['id']}/capture",
+                                      {"amount": pay_doc["amount_minor"], "currency": pay_doc["currency"]})
+        except HTTPException:
+            payment = await _razorpay("GET", f"/payments/{payment['id']}")
+    if payment.get("status") != "captured":
+        return False
+    await db.payments.update_one(
+        {"provider": "razorpay", "provider_ref": order_id},
+        {"$set": {"provider_payment_id": payment.get("id")}},
+    )
+    await _credit_purchase(
+        pay_doc["user_id"], pay_doc["pack_id"], provider="razorpay", ref=order_id,
+        amount=pay_doc.get("amount"), currency=pay_doc.get("currency"),
+    )
+    return True
+
+
+@api.post("/billing/razorpay/order")
+async def razorpay_create_order(body: RazorpayOrderIn, current=Depends(get_current_user)):
+    if not _razorpay_ready():
+        raise HTTPException(503, "Web payments aren't available yet. You can buy credits in the Rymind mobile app.")
+    pack = PACKS[body.pack_id]
+    currency = _billing_currency(current)
+    price = pack["price_inr"] if currency == "INR" else pack["price_usd"]
+    amount_minor = int(round(price * 100))
+    order = await _razorpay("POST", "/orders", {
+        "amount": amount_minor,
+        "currency": currency,
+        "receipt": f"rym_{uuid.uuid4().hex[:20]}",
+        "notes": {"user_id": current["id"], "pack_id": pack["id"]},
+    })
+    await db.payments.insert_one({
+        "id": str(uuid.uuid4()),
+        "provider": "razorpay",
+        "provider_ref": order["id"],
+        "user_id": current["id"],
+        "pack_id": pack["id"],
+        "credits": pack["credits"],
+        "amount": price,
+        "amount_minor": amount_minor,
+        "currency": currency,
+        "status": "created",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {
+        "order_id": order["id"],
+        "key_id": RAZORPAY_KEY_ID,
+        "amount": amount_minor,
+        "currency": currency,
+        "pack_id": pack["id"],
+        "description": f"{pack['name']} pack, {pack['credits']:,} credits",
+        "prefill": {
+            "name": current.get("full_name") or "",
+            "email": current.get("email") or "",
+            "contact": current.get("phone_full") or "",
+        },
+    }
+
+
+@api.post("/billing/razorpay/verify")
+async def razorpay_verify(body: RazorpayVerifyIn, current=Depends(get_current_user)):
+    if not _razorpay_ready():
+        raise HTTPException(503, "Web payments aren't available yet.")
+    expected = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        f"{body.razorpay_order_id}|{body.razorpay_payment_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, body.razorpay_signature):
+        raise HTTPException(400, "We couldn't verify this payment. If money was taken, contact support and we'll fix it.")
+    pay_doc = await db.payments.find_one(
+        {"provider": "razorpay", "provider_ref": body.razorpay_order_id, "user_id": current["id"]}, {"_id": 0}
+    )
+    if not pay_doc:
+        raise HTTPException(404, "Order not found.")
+    payment = await _razorpay("GET", f"/payments/{body.razorpay_payment_id}")
+    if not await _settle_razorpay_order(body.razorpay_order_id, payment):
+        raise HTTPException(
+            400, "This payment hasn't completed yet. If money was taken, your credits will be added within a few minutes."
+        )
+    fresh = await db.users.find_one({"id": current["id"]}, {"_id": 0})
+    return _billing_summary(fresh or current)
+
+
+@api.post("/billing/razorpay/webhook")
+async def razorpay_webhook(request: Request, x_razorpay_signature: Optional[str] = Header(None)):
+    """Backstop for web payments: credits orders even if the buyer closed the tab
+    before the checkout callback ran, and claws back refunds."""
+    if not RAZORPAY_WEBHOOK_SECRET:
+        raise HTTPException(503, "Razorpay webhook is not configured.")
+    raw = await request.body()
+    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    if not x_razorpay_signature or not hmac.compare_digest(expected, x_razorpay_signature):
+        raise HTTPException(400, "Invalid signature")
+    data = json.loads(raw or b"{}")
+    event = data.get("event")
+    entities = data.get("payload") or {}
+    payment = (entities.get("payment") or {}).get("entity") or {}
+    if event in ("payment.captured", "order.paid") and payment.get("order_id"):
+        await _settle_razorpay_order(payment["order_id"], payment)
+    elif event == "payment.failed" and payment.get("order_id"):
+        await db.payments.update_one(
+            {"provider": "razorpay", "provider_ref": payment["order_id"], "status": "created"},
+            {"$set": {"status": "failed"}},
+        )
+    elif event in ("refund.processed", "refund.created"):
+        refund = (entities.get("refund") or {}).get("entity") or {}
+        pay = await db.payments.find_one(
+            {"provider": "razorpay", "provider_payment_id": refund.get("payment_id")}, {"_id": 0}
+        )
+        if pay:
+            await _refund_purchase("razorpay", pay["provider_ref"])
+    return {"ok": True}
+
+
 # ------- Admin Analytics -------
 @api.get("/admin/analytics")
 async def get_admin_analytics():
@@ -1882,6 +2859,16 @@ async def get_admin_user_activity():
     return {"reminders": items, "total": len(items)}
 
 
+def _require_admin(x_admin_key: Optional[str]) -> None:
+    """Endpoints that expose PII or take action are gated by the ADMIN_KEY secret,
+    sent as the X-Admin-Key header."""
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not admin_key:
+        raise HTTPException(503, "ADMIN_KEY is not configured on the server.")
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, admin_key):
+        raise HTTPException(403, "Forbidden")
+
+
 @api.get("/admin/marketing-emails")
 async def get_marketing_emails(
     format: str = "json",
@@ -1894,11 +2881,7 @@ async def get_marketing_emails(
     (or an `?key=` won't work — header only). Set ADMIN_KEY in the backend env.
     Pass ?format=csv to download a CSV suitable for import into an email tool.
     """
-    admin_key = os.environ.get("ADMIN_KEY")
-    if not admin_key:
-        raise HTTPException(503, "ADMIN_KEY is not configured on the server.")
-    if x_admin_key != admin_key:
-        raise HTTPException(403, "Forbidden")
+    _require_admin(x_admin_key)
 
     docs = await db.users.find(
         {"marketing_consent": True},
@@ -1924,6 +2907,231 @@ async def get_marketing_emails(
         )
 
     return {"total": len(docs), "users": docs}
+
+
+# ------- Admin: credits -------
+class AdminCreditGrantIn(BaseModel):
+    credits: float = Field(..., gt=0, le=100000)
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+def _admin_user_row(d: dict) -> dict:
+    return {
+        "id": d["id"],
+        "full_name": d.get("full_name", ""),
+        "email": d.get("email", ""),
+        "phone_full": d.get("phone_full"),
+        "plan": _effective_plan(d),
+        "credits": _tenths_to_credits(_credits_tenths(d)),
+        "welcome_gift": bool(d.get("welcome_gift_at")),
+        "created_at": d.get("created_at"),
+    }
+
+
+@api.get("/admin/billing/users")
+async def admin_billing_users(q: str = "", x_admin_key: Optional[str] = Header(None)):
+    """Search users by name, email or phone to see their plan and credits, plus
+    purchase totals. Newest accounts first when no search is given."""
+    _require_admin(x_admin_key)
+    query: dict = {}
+    if q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query = {"$or": [{"email": rx}, {"full_name": rx}, {"phone_full": rx}]}
+    projection = {"_id": 0, "id": 1, "full_name": 1, "email": 1, "phone_full": 1, "plan": 1,
+                  "credits_tenths": 1, "welcome_gift_at": 1, "created_at": 1}
+    docs, revenue, paying_users = await asyncio.gather(
+        db.users.find(query, projection).sort("created_at", -1).limit(25).to_list(25),
+        db.payments.aggregate([
+            {"$match": {"status": "paid"}},
+            {"$group": {"_id": "$currency", "amount": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+        ]).to_list(20),
+        db.users.count_documents({"credits_tenths": {"$gt": 0}}),
+    )
+    return {
+        "users": [_admin_user_row(d) for d in docs],
+        "summary": {
+            "users_with_credits": paying_users,
+            "revenue": [{"currency": r["_id"] or "?", "amount": round(r["amount"] or 0, 2), "count": r["count"]}
+                        for r in revenue],
+        },
+    }
+
+
+@api.post("/admin/billing/users/{uid}/credits")
+async def admin_grant_credits(uid: str, body: AdminCreditGrantIn, x_admin_key: Optional[str] = Header(None)):
+    """Add credits to a user by hand, e.g. a goodwill gift or a refund for a failed send."""
+    _require_admin(x_admin_key)
+    ok = await _grant_credits(
+        uid,
+        int(round(body.credits * 10)),
+        kind="admin",
+        key=f"admin:{uuid.uuid4()}",
+        note=(body.note or "").strip() or "Added by Rymind support",
+    )
+    if not ok:
+        raise HTTPException(404, "User not found")
+    u = await db.users.find_one({"id": uid}, {"_id": 0})
+    return _admin_user_row(u)
+
+
+# ------- Admin: email broadcast -------
+class AdminEmailIn(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=150)
+    body: str = Field(..., min_length=1, max_length=20000)
+    audience: Literal["all", "marketing"] = "marketing"
+    cta_label: Optional[str] = Field(default=None, max_length=40)
+    cta_url: Optional[str] = Field(default=None, max_length=500)
+    test_email: Optional[EmailStr] = None
+
+
+_URL_RE = re.compile(r"(https?://[^\s<]+)")
+_background_tasks: set = set()
+
+
+def _render_admin_email_body(text: str, first_name: str) -> str:
+    """Plain text from the admin composer -> safe HTML: blank lines become paragraphs,
+    URLs become links, and {name} becomes the recipient's first name."""
+    safe = html_lib.escape(text.replace("{name}", first_name))
+    safe = _URL_RE.sub(lambda m: f'<a href="{m.group(1)}" style="color:#2A4B41">{m.group(1)}</a>', safe)
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", safe) if p.strip()]
+    return "".join(f'<p style="margin:0 0 14px">{p.replace(chr(10), "<br>")}</p>' for p in paragraphs)
+
+
+def _admin_email_params(campaign: dict, recipient: dict) -> dict:
+    email = recipient["email"]
+    first = ((recipient.get("full_name") or "").strip().split(" ") or [""])[0] or "there"
+    footer = "You're receiving this because you have a Rymind account."
+    params: dict = {"from": RESEND_FROM, "to": [email], "subject": campaign["subject"]}
+    if campaign["audience"] == "marketing":
+        unsub = f"{WEB_APP_URL}/unsubscribe?email={quote(email)}"
+        footer = (
+            "You're receiving this because you opted in to updates from Rymind. "
+            f'<a href="{unsub}" style="color:#94978F">Unsubscribe</a>'
+        )
+        params["headers"] = {"List-Unsubscribe": f"<{unsub}>"}
+    params["html"] = _branded_email_html(
+        None,
+        _render_admin_email_body(campaign["body"], first),
+        campaign.get("cta_label"),
+        campaign.get("cta_url"),
+        footer,
+    )
+    return params
+
+
+async def _run_email_campaign(campaign_id: str, recipients: list[dict]) -> None:
+    """Send in batches of 100 through Resend's batch API, pausing between calls to
+    stay under its rate limit, and keep the campaign's counters current."""
+    import resend  # type: ignore
+
+    resend.api_key = RESEND_KEY
+    campaign = await db.email_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        return
+    sent = failed = 0
+    last_error = None
+    for i in range(0, len(recipients), 100):
+        chunk = recipients[i:i + 100]
+        try:
+            await asyncio.to_thread(resend.Batch.send, [_admin_email_params(campaign, r) for r in chunk])
+            sent += len(chunk)
+        except Exception as e:
+            failed += len(chunk)
+            last_error = str(e)[:300]
+            logger.warning("[email-campaign] batch %d failed: %s", i // 100, e)
+        await db.email_campaigns.update_one({"id": campaign_id}, {"$set": {"sent": sent, "failed": failed}})
+        await asyncio.sleep(0.6)
+    status_ = "sent" if failed == 0 else ("failed" if sent == 0 else "partial")
+    await db.email_campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"status": status_, "last_error": last_error,
+                  "finished_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+
+@api.get("/admin/email/audience")
+async def admin_email_audience(x_admin_key: Optional[str] = Header(None)):
+    _require_admin(x_admin_key)
+    has_email = {"email": {"$exists": True, "$ne": ""}}
+    all_count, marketing_count = await asyncio.gather(
+        db.users.count_documents(has_email),
+        db.users.count_documents({**has_email, "marketing_consent": True}),
+    )
+    return {"all": all_count, "marketing": marketing_count, "email_ready": bool(RESEND_KEY)}
+
+
+@api.get("/admin/email/campaigns")
+async def admin_email_campaigns(x_admin_key: Optional[str] = Header(None)):
+    _require_admin(x_admin_key)
+    docs = await db.email_campaigns.find({}, {"_id": 0, "body": 0}).sort("created_at", -1).limit(20).to_list(20)
+    return {"campaigns": docs}
+
+
+@api.post("/admin/email/send")
+async def admin_send_email(body: AdminEmailIn, x_admin_key: Optional[str] = Header(None)):
+    """Send a branded email to every user (service announcements, e.g. the plan
+    change) or only to those who opted in to marketing. Pass test_email to send a
+    single preview first."""
+    _require_admin(x_admin_key)
+    if not RESEND_KEY:
+        raise HTTPException(503, "Email sending isn't configured. Set RESEND_API_KEY on the server.")
+    cta_label = (body.cta_label or "").strip() or None
+    cta_url = (body.cta_url or "").strip() or None
+    if bool(cta_label) != bool(cta_url):
+        raise HTTPException(400, "Add both a button label and a button link, or leave both empty.")
+    if cta_url and not cta_url.startswith(("https://", "http://")):
+        raise HTTPException(400, "The button link must start with https://")
+    campaign = {
+        "subject": body.subject.strip(),
+        "body": body.body.strip(),
+        "audience": body.audience,
+        "cta_label": cta_label,
+        "cta_url": cta_url,
+    }
+
+    if body.test_email:
+        import resend  # type: ignore
+
+        resend.api_key = RESEND_KEY
+        params = _admin_email_params(campaign, {"email": str(body.test_email), "full_name": ""})
+        params["subject"] = f"[Test] {params['subject']}"
+        try:
+            await asyncio.to_thread(resend.Emails.send, params)
+        except Exception as e:
+            logger.warning("[email-campaign] test send failed: %s", e)
+            raise HTTPException(502, "The test email couldn't be sent. Check the Resend settings and try again.")
+        return {"test": True, "sent_to": str(body.test_email)}
+
+    if await db.email_campaigns.find_one({"status": "sending"}, {"_id": 1}):
+        raise HTTPException(409, "Another email is still sending. Wait for it to finish first.")
+    query: dict = {"email": {"$exists": True, "$ne": ""}}
+    if body.audience == "marketing":
+        query["marketing_consent"] = True
+    seen: set[str] = set()
+    recipients = []
+    async for u in db.users.find(query, {"_id": 0, "email": 1, "full_name": 1}):
+        email = (u.get("email") or "").strip().lower()
+        if email and email not in seen:
+            seen.add(email)
+            recipients.append({"email": email, "full_name": u.get("full_name")})
+    if not recipients:
+        raise HTTPException(400, "Nobody is in this audience yet.")
+    doc = {
+        "id": str(uuid.uuid4()),
+        **campaign,
+        "status": "sending",
+        "total": len(recipients),
+        "sent": 0,
+        "failed": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.email_campaigns.insert_one(doc)
+    task = asyncio.create_task(_run_email_campaign(doc["id"], recipients))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    doc.pop("_id", None)
+    doc.pop("body", None)
+    return doc
 
 
 app.include_router(api)
