@@ -6,6 +6,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Application from "expo-application";
 import Constants from "expo-constants";
 import { useAuth } from "../../src/auth";
+import { formatCredits, useBilling } from "../../src/billing";
 import { apiFetch } from "../../src/api";
 import { Button, Card, SectionTitle } from "../../src/ui";
 import { colors, radius, spacing } from "../../src/theme";
@@ -15,6 +16,7 @@ import { isValidEmail } from "../../src/utils";
 
 export default function Profile() {
   const { user, logout, refresh } = useAuth();
+  const { billing, refresh: refreshBilling } = useBilling();
   const router = useRouter();
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -29,7 +31,7 @@ export default function Profile() {
 
   // Keep the profile fresh on focus — the push token is saved after login, so a
   // cached user can otherwise show "Not set" even when notifications are enabled.
-  useFocusEffect(useCallback(() => { refresh(); }, []));
+  useFocusEffect(useCallback(() => { refresh(); refreshBilling(); }, []));
 
   const openPhoneEdit = () => {
     if (!user) return;
@@ -134,6 +136,34 @@ export default function Profile() {
             </TouchableOpacity>
             <Divider />
             <Row icon="globe-outline" label="Region" value={user?.country_code || "+91"} />
+          </Card>
+        </View>
+
+        <View style={{ marginTop: spacing.lg }}>
+          <SectionTitle>Plan and credits</SectionTitle>
+          <Card>
+            <TouchableOpacity onPress={() => router.push("/plans")} activeOpacity={0.7} testID="profile-plans">
+              <Row
+                icon="ribbon-outline"
+                label="Plan"
+                value={billing ? billing.plans.find((p) => p.id === billing.plan)?.name || "Free" : ""}
+                chevron
+              />
+            </TouchableOpacity>
+            <Divider />
+            <TouchableOpacity onPress={() => router.push("/plans")} activeOpacity={0.7} testID="profile-credits">
+              <Row
+                icon="wallet-outline"
+                label="Credits"
+                value={billing ? formatCredits(billing.credits) : ""}
+                valueColor={billing && billing.credits > 0 ? colors.primary : undefined}
+                chevron
+              />
+            </TouchableOpacity>
+            <Divider />
+            <TouchableOpacity onPress={() => router.push("/credits")} activeOpacity={0.7} testID="profile-credit-history">
+              <Row icon="receipt-outline" label="Credit history" chevron />
+            </TouchableOpacity>
           </Card>
         </View>
 

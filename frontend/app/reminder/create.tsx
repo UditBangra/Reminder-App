@@ -20,6 +20,7 @@ import { PickerSheet } from "../../src/PickerSheet";
 import { colors, radius, spacing } from "../../src/theme";
 import { apiFetch } from "../../src/api";
 import { useAuth } from "../../src/auth";
+import { formatCredits, useBilling } from "../../src/billing";
 import { combineDateTime, fmtDate, isValidEmail } from "../../src/utils";
 import { maybeAskForRating, recordReminderCreated } from "../../src/rating";
 import { isValidPhoneNumber } from "../../src/countries";
@@ -102,7 +103,26 @@ export default function CreateReminder() {
   const [savedSheet, setSavedSheet] = useState(false);
   const [isReschedule, setIsReschedule] = useState(false);
 
-  const inIndia = (user?.country_code || "+91") === "+91";
+  // Free plan = app notifications only; WhatsApp/SMS/email need credits.
+  const { billing, refresh: refreshBilling } = useBilling();
+  const isFree = billing?.plan === "free";
+  const rates = billing?.rates;
+  const costLabel = (n?: number) => (n === undefined ? undefined : `${formatCredits(n)} credits per message`);
+
+  const showPlansPrompt = (title: string, body: string) =>
+    Alert.alert(title, body, [
+      { text: "Not now", style: "cancel" },
+      { text: "See plans", onPress: () => router.push("/plans") },
+    ]);
+
+  // A rescheduled reminder may carry paid channels from before; drop them on Free.
+  useEffect(() => {
+    if (!isFree) return;
+    setChannels((prev) => {
+      const kept = prev.filter((c) => c === "push");
+      return kept.length ? kept : ["push"];
+    });
+  }, [isFree]);
 
   useEffect(() => {
     (async () => {
@@ -121,7 +141,8 @@ export default function CreateReminder() {
         setIsReschedule(true);
         setTitle(r.title || "");
         setMessage(r.message || "");
-        setChannels((r.channels || ["push"]) as Channel[]);
+        const prefillChannels = (r.channels || ["push"]) as Channel[];
+        setChannels(isFree ? (["push"] as Channel[]) : prefillChannels);
         const rc = r.repeat_count ?? 1;
         setRepeatEnabled(rc === -1 || rc > 1);
         setRepeatCount(rc === -1 ? "0" : rc > 1 ? String(rc) : "");
@@ -159,6 +180,12 @@ export default function CreateReminder() {
   }, [prefill]);
 
   const toggleChannel = (c: Channel) => {
+    if (isFree && c !== "push" && !channels.includes(c)) {
+      return showPlansPrompt(
+        "Credits needed",
+        "WhatsApp, SMS and email come with the credit packs. Buy credits to use them, or keep App Notification, which is free."
+      );
+    }
     setChannels((prev) => (prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]));
   };
 
@@ -297,9 +324,11 @@ export default function CreateReminder() {
         } catch {}
       }
       recordReminderCreated();
+      refreshBilling();
       setSavedSheet(true);
     } catch (e: any) {
-      Alert.alert("Error", e.message);
+      if (isFree) showPlansPrompt("Upgrade to continue", e.message);
+      else Alert.alert("Error", e.message);
     } finally {
       setSaving(false);
     }
@@ -424,6 +453,7 @@ export default function CreateReminder() {
                   icon="notifications-outline"
                   title="App Notification"
                   desc="Instant push on this device"
+                  cost="Free"
                   selected={channels.includes("push")}
                   onPress={() => toggleChannel("push")}
                   testID="ch-push"
@@ -432,6 +462,8 @@ export default function CreateReminder() {
                   icon="logo-whatsapp"
                   title="WhatsApp"
                   desc="Send a WhatsApp message"
+                  cost={costLabel(rates?.whatsapp)}
+                  locked={isFree}
                   selected={channels.includes("whatsapp")}
                   onPress={() => toggleChannel("whatsapp")}
                   testID="ch-whatsapp"
@@ -440,26 +472,33 @@ export default function CreateReminder() {
                   icon="mail-outline"
                   title="Email"
                   desc="Deliver to inbox"
+                  cost={costLabel(rates?.email)}
+                  locked={isFree}
                   selected={channels.includes("email")}
                   onPress={() => toggleChannel("email")}
                   testID="ch-email"
                 />
-                {inIndia ? (
-                  <ChannelTile
-                    icon="chatbubble-outline"
-                    title="SMS"
-                    desc="Text message (India only)"
-                    selected={channels.includes("sms")}
-                    onPress={() => toggleChannel("sms")}
-                    testID="ch-sms"
-                  />
-                ) : (
-                  <Card style={{ opacity: 0.55 }}>
-                    <Text style={{ fontWeight: "700", color: colors.text }}>SMS not available</Text>
-                    <Text style={{ color: colors.textMuted, fontSize: 13 }}>Currently supported only for India users.</Text>
-                  </Card>
-                )}
+                <ChannelTile
+                  icon="chatbubble-outline"
+                  title="SMS"
+                  desc="Text message"
+                  cost={costLabel(rates?.sms)}
+                  locked={isFree}
+                  selected={channels.includes("sms")}
+                  onPress={() => toggleChannel("sms")}
+                  testID="ch-sms"
+                />
               </View>
+              {billing ? (
+                <TouchableOpacity onPress={() => router.push("/plans")} style={styles.creditNote} activeOpacity={0.8}>
+                  <Ionicons name={isFree ? "lock-closed-outline" : "wallet-outline"} size={15} color={colors.primary} />
+                  <Text style={styles.creditNoteText}>
+                    {isFree
+                      ? "You're on the Free plan. Buy a credit pack to unlock WhatsApp, SMS and email."
+                      : `You have ${formatCredits(billing.credits)} credits. Each message is charged when it's sent.`}
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
             </>
           )}
 
@@ -470,6 +509,11 @@ export default function CreateReminder() {
                 <Chip label="Myself" selected={isSelf} onPress={() => { setIsSelf(true); setContactId(null); }} icon="person-outline" testID="target-self" />
                 <Chip label="Someone else" selected={!isSelf} onPress={() => setIsSelf(false)} icon="people-outline" testID="target-other" />
               </View>
+              {!isSelf && channels.some((c) => c !== "push") ? (
+                <Text style={styles.copyNote}>
+                  {"You'll get your own copy on WhatsApp, SMS or email, and that copy uses credits. Sending it on to them from your phone is free."}
+                </Text>
+              ) : null}
 
               {isSelf && (
                 <Card style={{ backgroundColor: colors.primaryTint, borderColor: "transparent", flexDirection: "row", alignItems: "center" }}>
@@ -617,6 +661,8 @@ function ChannelTile({
   icon,
   title,
   desc,
+  cost,
+  locked,
   selected,
   onPress,
   testID,
@@ -624,6 +670,8 @@ function ChannelTile({
   icon: any;
   title: string;
   desc: string;
+  cost?: string;
+  locked?: boolean;
   selected: boolean;
   onPress: () => void;
   testID?: string;
@@ -634,7 +682,7 @@ function ChannelTile({
         style={{
           borderWidth: 1.5,
           borderColor: selected ? colors.primary : colors.border,
-          backgroundColor: selected ? colors.primaryTint : colors.surface,
+          backgroundColor: selected ? colors.primaryTint : locked ? colors.surfaceAlt : colors.surface,
           borderRadius: radius.lg,
           padding: spacing.md,
           flexDirection: "row",
@@ -646,19 +694,26 @@ function ChannelTile({
             width: 44,
             height: 44,
             borderRadius: 12,
-            backgroundColor: selected ? colors.primary : colors.primaryTint,
+            backgroundColor: selected ? colors.primary : locked ? colors.secondary : colors.primaryTint,
             alignItems: "center",
             justifyContent: "center",
             marginRight: 12,
           }}
         >
-          <Ionicons name={icon} size={20} color={selected ? "#fff" : colors.primary} />
+          <Ionicons name={icon} size={20} color={selected ? "#fff" : locked ? colors.textMuted : colors.primary} />
         </View>
         <View style={{ flex: 1 }}>
-          <Text style={{ fontWeight: "700", color: colors.text, fontSize: 16 }}>{title}</Text>
-          <Text style={{ color: colors.textMuted, fontSize: 13 }}>{desc}</Text>
+          <Text style={{ fontWeight: "700", color: locked ? colors.textMuted : colors.text, fontSize: 16 }}>{title}</Text>
+          <Text style={{ color: colors.textMuted, fontSize: 13 }}>{locked ? "Needs credits" : desc}</Text>
+          {cost && !locked ? (
+            <Text style={{ color: colors.primary, fontSize: 12, fontWeight: "600", marginTop: 2 }}>{cost}</Text>
+          ) : null}
         </View>
-        {selected ? <Ionicons name="checkmark-circle" size={22} color={colors.primary} /> : null}
+        {selected ? (
+          <Ionicons name="checkmark-circle" size={22} color={colors.primary} />
+        ) : locked ? (
+          <Ionicons name="lock-closed" size={18} color={colors.textMuted} />
+        ) : null}
       </View>
     </TouchableOpacity>
   );
@@ -872,6 +927,14 @@ function ReadOnlyRow({ label, value }: { label: string; value: string }) {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
+  creditNote: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    marginTop: spacing.md,
+    paddingHorizontal: 4,
+  },
+  creditNoteText: { flex: 1, marginLeft: 8, fontSize: 12, lineHeight: 17, color: colors.textMuted },
+  copyNote: { fontSize: 12, lineHeight: 17, color: colors.textMuted, marginTop: -4, marginBottom: spacing.md },
   topRow: {
     flexDirection: "row",
     alignItems: "center",

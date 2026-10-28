@@ -13,6 +13,8 @@ export type User = {
   phone_verified: boolean;
   email_verified: boolean;
   marketing_consent?: boolean;
+  plan?: "free" | "starter" | "popular" | "business";
+  credits?: number;
 };
 
 type Ctx = {

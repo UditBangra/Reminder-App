@@ -12,7 +12,9 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useFocusEffect, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useAuth } from "../../src/auth";
+import { formatCredits, useBilling } from "../../src/billing";
 import { apiFetch } from "../../src/api";
 import { colors, radius, shadow, spacing } from "../../src/theme";
 import { Badge, Card, SectionTitle } from "../../src/ui";
@@ -37,6 +39,8 @@ type Reminder = {
   needs_user_send?: boolean;
 };
 
+const PLANS_INTRO_KEY = "rymind.plans.introSeen";
+
 const CHANNEL_ICON: Record<string, any> = {
   push: "notifications-outline",
   whatsapp: "logo-whatsapp",
@@ -54,6 +58,20 @@ export default function Dashboard() {
   const [items, setItems] = useState<Reminder[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
+  const { billing, refresh: refreshBilling } = useBilling();
+
+  // Show the plans screen once after this update so everyone sees the new plans
+  // (and existing users see their welcome gift).
+  useEffect(() => {
+    if (!billing) return;
+    (async () => {
+      try {
+        if (await AsyncStorage.getItem(PLANS_INTRO_KEY)) return;
+        await AsyncStorage.setItem(PLANS_INTRO_KEY, "1");
+        router.push({ pathname: "/plans", params: { intro: "1" } });
+      } catch {}
+    })();
+  }, [!!billing]);
 
   const load = async () => {
     try {
@@ -69,8 +87,12 @@ export default function Dashboard() {
   useFocusEffect(
     useCallback(() => {
       load();
+      refreshBilling();
     }, [])
   );
+
+  const isFree = billing?.plan === "free";
+  const pausedCount = isFree ? billing?.paid_channel_reminders || 0 : 0;
 
   useEffect(() => {
     registerForPush();
@@ -95,16 +117,44 @@ export default function Dashboard() {
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={styles.greet}>{greeting()},</Text>
           <Text style={styles.name}>{user?.full_name?.split(" ")[0] || "there"}</Text>
         </View>
+        {billing ? (
+          <TouchableOpacity
+            activeOpacity={0.85}
+            onPress={() => router.push("/plans")}
+            style={[styles.creditPill, isFree ? styles.creditPillFree : null]}
+            testID="dashboard-credits"
+          >
+            <Ionicons name={isFree ? "arrow-up-circle" : "wallet-outline"} size={15} color={isFree ? "#fff" : colors.primary} />
+            <Text style={[styles.creditPillText, isFree ? { color: "#fff" } : null]}>
+              {isFree ? "Upgrade" : `${formatCredits(billing.credits)} credits`}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
         <View style={styles.avatar}>
           <Text style={{ color: "#fff", fontWeight: "700" }}>
             {(user?.full_name || "U").slice(0, 1).toUpperCase()}
           </Text>
         </View>
       </View>
+
+      {pausedCount > 0 ? (
+        <TouchableOpacity activeOpacity={0.9} onPress={() => router.push("/plans")} style={styles.paused} testID="dashboard-paused">
+          <View style={styles.pausedIcon}>
+            <Ionicons name="pause" size={16} color="#9A6B2F" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.pausedTitle}>WhatsApp, SMS and email are paused</Text>
+            <Text style={styles.pausedBody}>
+              {pausedCount === 1 ? "1 reminder uses" : `${pausedCount} reminders use`} these channels. Add credits to send them again. App notifications still arrive.
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color="#9A6B2F" />
+        </TouchableOpacity>
+      ) : null}
 
       <View style={styles.summaryCard}>
         <View style={{ flex: 1 }}>
@@ -253,6 +303,41 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  creditPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: 34,
+    paddingHorizontal: 12,
+    borderRadius: radius.pill,
+    backgroundColor: colors.primaryTint,
+    marginRight: 10,
+  },
+  creditPillFree: { backgroundColor: colors.primary },
+  creditPillText: { fontSize: 13, fontWeight: "700", color: colors.primary, fontVariant: ["tabular-nums"] },
+  paused: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.sm,
+    padding: spacing.md,
+    borderRadius: radius.lg,
+    borderWidth: 1,
+    borderColor: "#EED9BC",
+    // Opaque tint, no elevation: Android draws shadows through translucent cards.
+    backgroundColor: "#FBF3E8",
+  },
+  pausedIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#F3E2C9",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  pausedTitle: { fontSize: 14, fontWeight: "700", color: colors.text },
+  pausedBody: { fontSize: 12, color: colors.textMuted, marginTop: 2, lineHeight: 17 },
   summaryCard: {
     marginHorizontal: spacing.lg,
     marginBottom: spacing.sm,
