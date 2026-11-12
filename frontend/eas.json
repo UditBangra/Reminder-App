@@ -11,7 +11,7 @@
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://remind-everywhere.preview.emergentagent.com",
         "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "",
-        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": ""
+        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "goog_MxbQeWiYkLkHJMhcfTtshJTirTh"
       },
       "android": {
         "buildType": "apk",
@@ -28,7 +28,7 @@
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://reminder-app-production-ce1f.up.railway.app",
         "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "",
-        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": ""
+        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "goog_MxbQeWiYkLkHJMhcfTtshJTirTh"
       },
       "android": {
         "buildType": "apk"
@@ -43,7 +43,7 @@
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://reminder-app-production-ce1f.up.railway.app",
         "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "",
-        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": ""
+        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "goog_MxbQeWiYkLkHJMhcfTtshJTirTh"
       },
       "android": {
         "buildType": "app-bundle"
