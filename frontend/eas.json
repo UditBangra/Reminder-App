@@ -10,7 +10,7 @@
       "channel": "development",
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://remind-everywhere.preview.emergentagent.com",
-        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "",
+        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "appl_IevOTNcNCLGGUipqKskEeCjqlOS",
         "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "goog_MxbQeWiYkLkHJMhcfTtshJTirTh"
       },
       "android": {
@@ -27,7 +27,7 @@
       "channel": "preview",
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://reminder-app-production-ce1f.up.railway.app",
-        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "",
+        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "appl_IevOTNcNCLGGUipqKskEeCjqlOS",
         "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "goog_MxbQeWiYkLkHJMhcfTtshJTirTh"
       },
       "android": {
@@ -42,7 +42,7 @@
       "autoIncrement": true,
       "env": {
         "EXPO_PUBLIC_BACKEND_URL": "https://reminder-app-production-ce1f.up.railway.app",
-        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "",
+        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "appl_IevOTNcNCLGGUipqKskEeCjqlOS",
         "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "goog_MxbQeWiYkLkHJMhcfTtshJTirTh"
       },
       "android": {
