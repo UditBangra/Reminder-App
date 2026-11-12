@@ -455,12 +455,15 @@ async def send_sms(to_phone: str, body: str) -> bool:
             c = Client(TWILIO_SID, TWILIO_TOKEN)
             # smart_encoded swaps look-alike Unicode (curly quotes, long dashes) for GSM-7
             # characters, so a typed apostrophe doesn't double the segment count.
-            c.messages.create(from_=TWILIO_PHONE, to=to_phone, body=body, smart_encoded=True)
+            return c.messages.create(from_=TWILIO_PHONE, to=to_phone, body=body, smart_encoded=True)
 
-        await asyncio.to_thread(_send)
+        msg = await asyncio.to_thread(_send)
+        logger.info("[sms] queued to=%s sid=%s status=%s", to_phone, getattr(msg, "sid", None), getattr(msg, "status", None))
         return True
     except Exception as e:
-        logger.warning("[sms] failed: %s", e)
+        # TwilioRestException carries Twilio's error code (e.g. 21608 unverified on trial,
+        # 21408 region not enabled, 21211 invalid number) — log it so failures are diagnosable.
+        logger.warning("[sms] failed to=%s code=%s: %s", to_phone, getattr(e, "code", None), e)
         return False
 
 
@@ -1509,7 +1512,7 @@ async def send_verification_code(payload: SendCodeIn):
         raise HTTPException(429, "Too many code requests. Please wait and try again.")
 
     code = _generate_verify_code()
-    await db.verification_codes.insert_one({
+    ins = await db.verification_codes.insert_one({
         "target": target,
         "value": value,
         "code": code,
@@ -1520,14 +1523,16 @@ async def send_verification_code(payload: SendCodeIn):
         phone_full = value if value.startswith("+") else f"{payload.country_code}{re.sub(r'[^0-9]', '', value)}"
         sms_body = f"Your Rymind verification code is: {code}. Valid for 10 minutes."
         sent = await send_sms(phone_full, sms_body)
-        if not sent:
-            logger.info("[verify] SMS code for %s: %s (mock/failed)", phone_full, code)
-    elif target == "email":
-        email_lower = value.lower()
-        html = _verification_email_html(code)
-        sent = await send_email(email_lower, "Your Rymind verification code", html)
-        if not sent:
-            logger.info("[verify] Email code for %s: %s (mock/failed)", email_lower, code)
+    else:
+        sent = await send_email(value.lower(), "Your Rymind verification code", _verification_email_html(code))
+
+    if not sent:
+        # Don't claim success when nothing went out — the user would wait for a code
+        # that never arrives. Drop the unsent code so it doesn't eat the hourly limit.
+        await db.verification_codes.delete_one({"_id": ins.inserted_id})
+        logger.warning("[verify] %s code could not be sent to %s", target, value)
+        what = "SMS" if target == "phone" else "email"
+        raise HTTPException(503, f"We couldn't send the verification {what} right now. Please try again in a few minutes.")
 
     return {"ok": True, "message": "Verification code sent"}
 
