@@ -63,7 +63,8 @@ Commits in this repo are split logically (backend vs frontend vs version bump) a
   - Payments: mobile via RevenueCat (`/billing/revenuecat/webhook` + `/billing/revenuecat/sync`), web via Razorpay (`/billing/razorpay/order|verify|webhook`, INR for +91 accounts, USD otherwise). All crediting goes through `_grant_credits` keyed on the provider transaction, so retries never double-credit. Env: `REVENUECAT_SECRET_KEY`, `REVENUECAT_WEBHOOK_AUTH`, `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`.
   - Accounts that predate billing get the Starter pack once as a welcome gift (`_migrate_existing_users_to_credits`, runs at startup).
   - Admin endpoints that expose PII or take action (`/admin/marketing-emails`, `/admin/billing/*`, `/admin/email/*`) are gated by `_require_admin` (`X-Admin-Key` = `ADMIN_KEY`).
-- **Real-time**: `broadcast_to_user()` pushes JSON events (`reminder.fired`, `contact.updated`, etc.) over `/api/ws/user` to keep the **web companion** in live sync. `/api/ws/web-session/{id}` drives the QR pairing handshake (the mobile app scans a QR in `linked-devices.tsx` to sign the web app in).
+- **Real-time**: `broadcast_to_user()` pushes JSON events (`reminder.fired`, `contact.updated`, etc.) over `/api/ws/user` to keep the **web companion** in live sync. `/api/ws/web-session/{id}` drives the QR pairing handshake (the mobile app scans a QR in `linked-devices.tsx` to sign the web app in). Rymind Web can also sign in with email+password via `POST /web-sessions/password-login`, which creates an already-approved web session so it still appears (and can be revoked) under Linked Devices.
+- **Login brute-force guard**: `/auth/login` and the web password login share `_authenticate_password`, which locks an email after 5 failed attempts (30 per IP) for 15 minutes using the TTL'd `login_failures` collection. A password reset clears the lock.
 
 ## Frontend architecture
 

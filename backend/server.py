@@ -1314,6 +1314,10 @@ async def lifespan(app: FastAPI):
     await db.contacts.create_index("user_id")
     # Verification codes auto-expire after 10 minutes
     await db.verification_codes.create_index("created_at", expireAfterSeconds=600)
+    # Failed logins are only counted inside the lockout window
+    await db.login_failures.create_index("at", expireAfterSeconds=LOGIN_WINDOW_MINUTES * 60)
+    await db.login_failures.create_index([("email", 1), ("at", -1)])
+    await db.login_failures.create_index([("ip", 1), ("at", -1)])
     # Migration: backfill phone_suffix on existing users
     async for u in db.users.find({"phone_suffix": {"$exists": False}}, {"_id": 0, "id": 1, "phone_full": 1, "phone": 1}):
         suffix = _phone_suffix(u.get("phone_full") or u.get("phone"))
@@ -1613,7 +1617,9 @@ async def reset_password(payload: ResetPasswordIn):
     hashed = await asyncio.to_thread(hash_password, payload.new_password)
     await db.users.update_one({"email": doc["email"]}, {"$set": {"password_hash": hashed}})
     await db.password_resets.delete_many({"email": doc["email"]})
-    
+    # A fresh password lifts any login lockout on this account.
+    await db.login_failures.delete_many({"email": doc["email"]})
+
     return {"ok": True, "message": "Password updated successfully"}
 
 
@@ -1689,14 +1695,54 @@ async def marketing_unsubscribe(payload: MarketingUnsubscribeIn):
     }
 
 
-@api.post("/auth/login", response_model=TokenOut)
-async def login(payload: UserLogin):
-    u = await db.users.find_one({"email": payload.email.lower().strip()})
+# Brute-force guard for /auth/login, which both the app and Rymind Web call.
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_MAX_FAILS_PER_EMAIL = 5
+LOGIN_MAX_FAILS_PER_IP = 30
+
+
+def _client_ip(request: Request) -> str:
+    # Railway sits behind a proxy; the first X-Forwarded-For hop is the client.
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+async def _check_login_lock(email: str, ip: str):
+    since = datetime.now(timezone.utc) - timedelta(minutes=LOGIN_WINDOW_MINUTES)
+    by_email = await db.login_failures.count_documents({"email": email, "at": {"$gte": since}})
+    by_ip = await db.login_failures.count_documents({"ip": ip, "at": {"$gte": since}}) if ip else 0
+    if by_email >= LOGIN_MAX_FAILS_PER_EMAIL or by_ip >= LOGIN_MAX_FAILS_PER_IP:
+        raise HTTPException(
+            429, f"Too many failed attempts. Please wait {LOGIN_WINDOW_MINUTES} minutes or reset your password."
+        )
+
+
+async def _record_login_failure(email: str, ip: str):
+    await db.login_failures.insert_one({"email": email, "ip": ip, "at": datetime.now(timezone.utc)})
+
+
+async def _authenticate_password(email: str, password: str, request: Request) -> dict:
+    """Shared email+password check for the app (/auth/login) and Rymind Web."""
+    email = email.lower().strip()
+    ip = _client_ip(request)
+    await _check_login_lock(email, ip)
+    u = await db.users.find_one({"email": email})
     if not u:
+        await _record_login_failure(email, ip)
         raise HTTPException(404, "No account found with this email. Please create an account to continue.")
-    if not await asyncio.to_thread(verify_password, payload.password, u["password_hash"]):
+    if not await asyncio.to_thread(verify_password, password, u["password_hash"]):
+        await _record_login_failure(email, ip)
         raise HTTPException(401, "Incorrect password. Please try again.")
-    
+    await db.login_failures.delete_many({"email": email})
+    return u
+
+
+@api.post("/auth/login", response_model=TokenOut)
+async def login(payload: UserLogin, request: Request):
+    u = await _authenticate_password(payload.email, payload.password, request)
+
     now = datetime.now(timezone.utc).isoformat()
     await db.users.update_one({"id": u["id"]}, {"$set": {"last_login_at": now}})
     
@@ -2335,6 +2381,40 @@ async def approve_web_session(
     # Push to any web client waiting on the websocket
     await _broadcast_qr(session_id, {"type": "approved", "token": token, "user": user})
     return {"ok": True}
+
+
+class WebPasswordLogin(BaseModel):
+    email: EmailStr
+    password: str
+    user_agent: Optional[str] = None
+
+
+@api.post("/web-sessions/password-login")
+async def web_password_login(body: WebPasswordLogin, request: Request):
+    """Email+password sign-in for Rymind Web. Creates an already-approved web
+    session so the browser shows up under Linked Devices on the phone and can be
+    signed out from there, exactly like a QR sign-in."""
+    u = await _authenticate_password(body.email, body.password, request)
+    sid = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    await db.web_sessions.insert_one({
+        "session_id": sid,
+        "status": "approved",
+        "user_id": u["id"],
+        "jwt_token": None,  # handed back directly below, never stored
+        "device_info": {
+            "ua": (body.user_agent or "")[:300],
+            "ip": _client_ip(request)[:64],
+            "label": None,  # app derives "Chrome on Windows" etc. from ua, same as QR
+        },
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=WEB_TOKEN_EXP_DAYS)).isoformat(),
+        "approved_at": now.isoformat(),
+        "last_seen_at": now.isoformat(),
+    })
+    await db.users.update_one({"id": u["id"]}, {"$set": {"last_login_at": now.isoformat()}})
+    user = await db.users.find_one({"id": u["id"]}, {"_id": 0, "password_hash": 0})
+    return {"session_id": sid, "token": _make_web_jwt(u["id"], sid), "user": user}
 
 
 @api.get("/web-sessions")
