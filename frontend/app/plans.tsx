@@ -208,7 +208,7 @@ function PackCard({
 
       {plan.features.slice(1).map((f) => (
         <View key={f} style={styles.feature}>
-          <Ionicons name="checkmark" size={16} color={hero ? MINT : colors.primary} />
+          <Ionicons name="checkmark" size={16} color={hero ? MINT : colors.primary} style={{ marginTop: 2 }} />
           <Text style={[styles.featureText, { color: fg }]}>{f}</Text>
         </View>
       ))}
@@ -249,7 +249,7 @@ function FreeCard({ plan, isCurrent }: { plan: PlanInfo; isCurrent: boolean }) {
       <Text style={styles.tagline}>{plan.tagline}</Text>
       {plan.features.map((f) => (
         <View key={f} style={styles.feature}>
-          <Ionicons name="checkmark" size={16} color={colors.textMuted} />
+          <Ionicons name="checkmark" size={16} color={colors.textMuted} style={{ marginTop: 2 }} />
           <Text style={[styles.featureText, { color: colors.textMuted }]}>{f}</Text>
         </View>
       ))}
@@ -355,11 +355,11 @@ const styles = StyleSheet.create({
   },
   tagText: { fontSize: 11, fontWeight: "700" },
   tagline: { fontSize: 13, color: colors.textMuted, marginTop: 4, lineHeight: 18 },
-  priceRow: { flexDirection: "row", alignItems: "baseline", marginTop: spacing.md, marginBottom: spacing.sm },
+  priceRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", columnGap: 8, marginTop: spacing.md, marginBottom: spacing.sm },
   price: { fontSize: 30, fontWeight: "800", letterSpacing: -0.8, fontVariant: ["tabular-nums"] },
-  priceCredits: { fontSize: 14, marginLeft: 8 },
-  feature: { flexDirection: "row", alignItems: "center", marginTop: 6 },
-  featureText: { fontSize: 14, marginLeft: 8 },
+  priceCredits: { fontSize: 14, flexShrink: 1 },
+  feature: { flexDirection: "row", alignItems: "flex-start", marginTop: 6 },
+  featureText: { flex: 1, fontSize: 14, lineHeight: 20, marginLeft: 8 },
   freeNote: { fontSize: 12, color: colors.textMuted, marginTop: spacing.sm, lineHeight: 17 },
   cta: {
     height: 50,
