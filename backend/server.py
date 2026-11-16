@@ -28,6 +28,7 @@ import bcrypt
 import httpx
 import jwt
 import pytz
+from dateutil.relativedelta import relativedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
@@ -307,6 +308,17 @@ def hash_password(p: str) -> str:
     return bcrypt.hashpw(p.encode(), bcrypt.gensalt(rounds=10)).decode()
 
 
+def _national_digits(raw: Optional[str], country_code: Optional[str] = None) -> str:
+    """Digits of a locally typed number, minus the trunk prefix "0" that many
+    countries use at home (Germany "0171...", UK "07..."). It must not appear after
+    the country code: "+49 0171..." is not a valid number and SMS to it fails.
+    Italy is the exception, where the leading 0 is part of the number."""
+    digits = re.sub(r"[^0-9]", "", raw or "")
+    if (country_code or "").strip() == "+39":
+        return digits
+    return digits.lstrip("0")
+
+
 def _phone_suffix(value: Optional[str]) -> Optional[str]:
     """Normalize any phone string to last-10-digits for cross-user matching.
     Strips '+', spaces, dashes, parentheses, country-code prefix if present.
@@ -445,9 +457,16 @@ async def send_whatsapp(
 
 
 async def send_sms(to_phone: str, body: str) -> bool:
+    ok, _code = await send_sms_detailed(to_phone, body)
+    return ok
+
+
+async def send_sms_detailed(to_phone: str, body: str) -> tuple[bool, Optional[int]]:
+    """Like send_sms, but also returns Twilio's error code on failure (None when
+    Twilio isn't configured or the error carried no code)."""
     if not _twilio_ready() or not TWILIO_PHONE:
         logger.info("[sms MOCK] to=%s body=%s", to_phone, body[:80])
-        return False
+        return False, None
     try:
         from twilio.rest import Client  # type: ignore
 
@@ -459,12 +478,13 @@ async def send_sms(to_phone: str, body: str) -> bool:
 
         msg = await asyncio.to_thread(_send)
         logger.info("[sms] queued to=%s sid=%s status=%s", to_phone, getattr(msg, "sid", None), getattr(msg, "status", None))
-        return True
+        return True, None
     except Exception as e:
         # TwilioRestException carries Twilio's error code (e.g. 21608 unverified on trial,
         # 21408 region not enabled, 21211 invalid number) — log it so failures are diagnosable.
-        logger.warning("[sms] failed to=%s code=%s: %s", to_phone, getattr(e, "code", None), e)
-        return False
+        code = getattr(e, "code", None)
+        logger.warning("[sms] failed to=%s code=%s: %s", to_phone, code, e)
+        return False, code if isinstance(code, int) else None
 
 
 async def send_email(to_email: str, subject: str, html: str) -> bool:
@@ -987,6 +1007,22 @@ def _parse_iso(s: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _calendar_months(interval_hours) -> Optional[int]:
+    """Both clients send "every N months" as N*720 hours and "every N years" as
+    N*8760 hours. Return the month count for those, so they repeat on the same
+    calendar date instead of drifting (30-day "months" slid a day earlier after
+    every 31-day month, e.g. a reminder for the 20th fired on the 19th)."""
+    try:
+        h = float(interval_hours)
+    except (TypeError, ValueError):
+        return None
+    if h >= 8760 and h % 8760 == 0:
+        return int(h // 8760) * 12
+    if h >= 720 and h % 720 == 0:
+        return int(h // 720)
+    return None
+
+
 def _compute_next_fire(r: dict) -> Optional[datetime]:
     """Compute the next UTC fire time considering lead_minutes, repeat_count, repeat_interval, triggered_count."""
     base = _parse_iso(r["scheduled_at"])
@@ -997,6 +1033,17 @@ def _compute_next_fire(r: dict) -> Optional[datetime]:
     if repeat_count != -1 and triggered >= repeat_count:
         return None
     try:
+        months = _calendar_months(r.get("repeat_interval_hours", 24))
+        if months and triggered:
+            # Step whole months on the user's own wall clock, always counted from the
+            # first occurrence: 31 Jan -> 28/29 Feb -> 31 Mar, at the same local time.
+            try:
+                tz = pytz.timezone(r.get("timezone") or "UTC")
+            except Exception:
+                tz = pytz.UTC
+            local_first = first.astimezone(tz).replace(tzinfo=None)
+            local_next = local_first + relativedelta(months=months * triggered)
+            return tz.localize(local_next).astimezone(timezone.utc)
         interval = timedelta(hours=float(r.get("repeat_interval_hours", 24)))
         return first + interval * triggered
     except (OverflowError, ValueError) as e:
@@ -1425,6 +1472,13 @@ async def health():
 
 
 # ------- Auth — Verification -------
+# Twilio errors that mean the number itself is the problem (not our account setup):
+# 21211 invalid 'To', 21614 not a mobile number, 21217 not a valid phone number,
+# 21612 'To' unreachable over SMS.
+TWILIO_BAD_NUMBER_CODES = {21211, 21217, 21612, 21614}
+# 21610: the recipient replied STOP to our number.
+TWILIO_BLOCKED_NUMBER_CODES = {21610}
+
 def _generate_verify_code() -> str:
     return str(random.randint(100000, 999999))
 
@@ -1500,6 +1554,12 @@ async def send_verification_code(payload: SendCodeIn):
     value = payload.value.strip()
     if not value:
         raise HTTPException(400, "Value is required")
+    if target == "phone":
+        # Clients send "<cc><typed digits>"; drop a trunk 0 after the code so the
+        # SMS goes to a valid number. verify-phone normalizes the same way.
+        cc = (payload.country_code or "").strip()
+        if cc and value.startswith(cc):
+            value = f"{cc}{_national_digits(value[len(cc):], cc)}"
 
     # Rate limit: max 5 codes per target+value per hour
     one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -1519,10 +1579,11 @@ async def send_verification_code(payload: SendCodeIn):
         "created_at": datetime.now(timezone.utc),
     })
 
+    sms_error: Optional[int] = None
     if target == "phone":
         phone_full = value if value.startswith("+") else f"{payload.country_code}{re.sub(r'[^0-9]', '', value)}"
         sms_body = f"Your Rymind verification code is: {code}. Valid for 10 minutes."
-        sent = await send_sms(phone_full, sms_body)
+        sent, sms_error = await send_sms_detailed(phone_full, sms_body)
     else:
         sent = await send_email(value.lower(), "Your Rymind verification code", _verification_email_html(code))
 
@@ -1530,7 +1591,11 @@ async def send_verification_code(payload: SendCodeIn):
         # Don't claim success when nothing went out — the user would wait for a code
         # that never arrives. Drop the unsent code so it doesn't eat the hourly limit.
         await db.verification_codes.delete_one({"_id": ins.inserted_id})
-        logger.warning("[verify] %s code could not be sent to %s", target, value)
+        logger.warning("[verify] %s code could not be sent to %s (twilio code=%s)", target, value, sms_error)
+        if sms_error in TWILIO_BAD_NUMBER_CODES:
+            raise HTTPException(400, "This phone number can't receive SMS. Please check the number and country code.")
+        if sms_error in TWILIO_BLOCKED_NUMBER_CODES:
+            raise HTTPException(400, "This number has blocked SMS from Rymind. Reply START to our earlier SMS, then try again.")
         what = "SMS" if target == "phone" else "email"
         raise HTTPException(503, f"We couldn't send the verification {what} right now. Please try again in a few minutes.")
 
@@ -1632,7 +1697,7 @@ async def reset_password(payload: ResetPasswordIn):
 @api.post("/auth/signup", response_model=TokenOut)
 async def signup(payload: UserSignup):
     email = payload.email.lower().strip()
-    phone_raw = re.sub(r"[^\d]", "", payload.phone)
+    phone_raw = _national_digits(payload.phone, payload.country_code)
     if not phone_raw:
         raise HTTPException(400, "Invalid phone number")
     phone_full = f"{payload.country_code}{phone_raw}"
@@ -1763,7 +1828,7 @@ async def me(current=Depends(get_current_user)):
 @api.post("/auth/verify-phone", response_model=UserOut)
 async def verify_phone(payload: VerifyPhoneIn, current=Depends(get_current_user)):
     """Verify (and optionally update) the signed-in user's phone via OTP."""
-    digits = re.sub(r"[^0-9]", "", payload.phone)
+    digits = _national_digits(payload.phone, payload.country_code)
     if not digits:
         raise HTTPException(400, "Please enter a valid phone number.")
     phone_full = f"{payload.country_code}{digits}"
@@ -1811,10 +1876,10 @@ async def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_u
     if payload.phone is not None:
         if current.get("phone_verified", True):
             raise HTTPException(400, "Please verify the new phone number to change it.")
-        digits = re.sub(r"[^0-9]", "", payload.phone)
+        cc = payload.country_code or current.get("country_code", "+91")
+        digits = _national_digits(payload.phone, cc)
         if len(digits) < 6:
             raise HTTPException(400, "Please enter a valid phone number.")
-        cc = payload.country_code or current.get("country_code", "+91")
         phone_full = f"{cc}{digits}"
         suffix = _phone_suffix(phone_full)
         other = await db.users.find_one({"phone_suffix": suffix, "id": {"$ne": current["id"]}})
@@ -1839,7 +1904,20 @@ async def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_u
 
 @api.post("/auth/push-token")
 async def set_push_token(body: PushTokenIn, current=Depends(get_current_user)):
+    # A device token belongs to whoever signed in last on that device. Without this,
+    # switching accounts on one phone kept delivering the old account's reminders.
+    await db.users.update_many(
+        {"expo_push_token": body.token, "id": {"$ne": current["id"]}},
+        {"$set": {"expo_push_token": None}},
+    )
     await db.users.update_one({"id": current["id"]}, {"$set": {"expo_push_token": body.token}})
+    return {"ok": True}
+
+
+@api.delete("/auth/push-token")
+async def clear_push_token(current=Depends(get_current_user)):
+    """Called on sign-out so this device stops getting the account's notifications."""
+    await db.users.update_one({"id": current["id"]}, {"$set": {"expo_push_token": None}})
     return {"ok": True}
 
 
