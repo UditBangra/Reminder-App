@@ -102,6 +102,21 @@ export async function registerForPush(): Promise<string | null> {
   return inFlight;
 }
 
+/** Detach this device's push token from the signed-in account (call before logout). */
+export async function unregisterPushToken(): Promise<void> {
+  if (Platform.OS === "web") return;
+  try {
+    // Don't hold up sign-out for long if the network is slow.
+    await Promise.race([
+      apiFetch("/auth/push-token", { method: "DELETE" }),
+      new Promise((resolve) => setTimeout(resolve, 4000)),
+    ]);
+  } catch {
+    // Offline or old backend: the server also moves the token on the next sign-in.
+  }
+  cachedToken = null;
+}
+
 /** Re-register after sign-in so the token is attached to the right account. */
 export async function refreshPushTokenAfterAuth(): Promise<void> {
   // Reset cache so we send the token to the API for the now-authed user

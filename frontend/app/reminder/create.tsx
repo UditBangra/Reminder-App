@@ -21,7 +21,7 @@ import { colors, radius, spacing } from "../../src/theme";
 import { apiFetch } from "../../src/api";
 import { useAuth } from "../../src/auth";
 import { formatCredits, useBilling } from "../../src/billing";
-import { combineDateTime, fmtDate, isValidEmail } from "../../src/utils";
+import { combineDateTime, fmtDate, fmtDay, isValidEmail } from "../../src/utils";
 import { maybeAskForRating, recordReminderCreated } from "../../src/rating";
 import { isValidPhoneNumber } from "../../src/countries";
 
@@ -165,6 +165,13 @@ export default function CreateReminder() {
         } else {
           setRepeatUnit("hour");
           setRepeatValue(String(hours));
+        }
+        // Keep the original date and time when it's still ahead; a past one
+        // falls back to the "5 minutes from now" default.
+        const original = r.scheduled_at ? new Date(r.scheduled_at) : null;
+        if (original && !isNaN(original.getTime()) && original.getTime() > Date.now()) {
+          setDate(original);
+          setTime(original);
         }
         const t = r.target || {};
         setIsSelf(!!t.is_self);
@@ -380,7 +387,7 @@ export default function CreateReminder() {
               <View style={{ flexDirection: "row", gap: 10 }}>
                 <TouchableOpacity style={[styles.pickBtn]} onPress={() => setShowDate(true)} testID="wizard-pick-date">
                   <Ionicons name="calendar-outline" size={18} color={colors.primary} />
-                  <Text style={styles.pickVal}>{date.toDateString()}</Text>
+                  <Text style={styles.pickVal}>{fmtDay(date)}</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={[styles.pickBtn]} onPress={() => setShowTime(true)} testID="wizard-pick-time">
                   <Ionicons name="time-outline" size={18} color={colors.primary} />

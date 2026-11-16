@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { apiFetch, clearToken, getToken, saveToken } from "./api";
-import { refreshPushTokenAfterAuth } from "./push";
+import { refreshPushTokenAfterAuth, unregisterPushToken } from "./push";
 
 export type User = {
   id: string;
@@ -35,6 +36,19 @@ type Ctx = {
 
 const AuthCtx = createContext<Ctx | null>(null);
 
+// Last known profile, so a launch without internet still opens the app signed in.
+const USER_CACHE_KEY = "remindly.user";
+const cacheUser = (u: User | null) =>
+  (u ? AsyncStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)) : AsyncStorage.removeItem(USER_CACHE_KEY)).catch(() => {});
+async function cachedUser(): Promise<User | null> {
+  try {
+    const raw = await AsyncStorage.getItem(USER_CACHE_KEY);
+    return raw ? (JSON.parse(raw) as User) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -48,9 +62,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const me = await apiFetch<User>("/auth/me");
       setUser(me);
-    } catch {
-      await clearToken();
-      setUser(null);
+      cacheUser(me);
+    } catch (e: any) {
+      // Only a rejected token means "signed out". A network blip or a server
+      // hiccup on launch must not throw the user back to the login screen.
+      if (e?.status === 401) {
+        await clearToken();
+        cacheUser(null);
+        setUser(null);
+      } else {
+        const cached = await cachedUser();
+        if (cached) setUser((cur) => cur ?? cached);
+      }
     }
   };
 
@@ -69,6 +92,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     await saveToken(res.access_token);
     setUser(res.user);
+    cacheUser(res.user);
     // Re-attempt push registration AFTER auth so token is bound to this user.
     refreshPushTokenAfterAuth().catch(() => {});
   };
@@ -88,11 +112,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     await saveToken(res.access_token);
     setUser(res.user);
+    cacheUser(res.user);
     refreshPushTokenAfterAuth().catch(() => {});
   };
 
   const logout = async () => {
+    // Detach this device first (needs the token), so the signed-out account's
+    // reminders stop arriving here.
+    await unregisterPushToken();
     await clearToken();
+    cacheUser(null);
     setUser(null);
   };
 

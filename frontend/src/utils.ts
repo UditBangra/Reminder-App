@@ -8,6 +8,15 @@ export function fmtDate(iso: string): string {
   }
 }
 
+/** Date only, same style as fmtDate: "Mon, 16 Nov 2026". */
+export function fmtDay(d: Date): string {
+  try {
+    return format(d, "EEE, d MMM yyyy");
+  } catch {
+    return d.toDateString();
+  }
+}
+
 export function fmtRelative(iso: string): string {
   try {
     const d = parseISO(iso);

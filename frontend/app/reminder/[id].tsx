@@ -62,6 +62,13 @@ export default function ReminderDetail() {
       const d = await apiFetch<Reminder>(`/reminders/${id}`);
       setR(d);
     } catch (e: any) {
+      if (e?.status === 404) {
+        // Deleted, or opened from an old notification: don't sit on "Loading…".
+        Alert.alert("Reminder not found", "This reminder was deleted or is no longer available.");
+        if (router.canGoBack()) router.back();
+        else router.replace("/(app)/dashboard");
+        return;
+      }
       Alert.alert("Error", e.message);
     }
   };

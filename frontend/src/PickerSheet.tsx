@@ -1,9 +1,17 @@
-import React, { useState } from "react";
-import { Modal, View, Text, TouchableOpacity, StyleSheet, Platform, ScrollView } from "react-native";
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Modal,
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ScrollView,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { colors, radius, spacing } from "./theme";
 import { Button } from "./ui";
-import { Ionicons } from "@expo/vector-icons";
 
 type Props = {
   visible: boolean;
@@ -13,31 +21,50 @@ type Props = {
   onConfirm: (d: Date) => void;
 };
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const ITEM_H = 40;
+const WHEEL_H = 200;
+const WHEEL_PAD = (WHEEL_H - ITEM_H) / 2;
+
+const daysInMonth = (year: number, month: number) => new Date(year, month + 1, 0).getDate();
+
 /**
- * Cross-platform date & time picker. On web we use simple spinners
- * (native <input> works poorly inside Expo web). On native we'd ideally
- * use @react-native-community/datetimepicker, but this approach is
- * consistent across platforms and avoids Metro issues.
+ * Cross-platform date & time picker built from scroll wheels. Each wheel opens
+ * scrolled to the current value, and the centered row is the selection, so what
+ * the user sees always matches what will be saved.
  */
 export function PickerSheet({ visible, initial, mode, onClose, onConfirm }: Props) {
   const [d, setD] = useState<Date>(initial || new Date());
   const insets = useSafeAreaInsets();
 
-  const days = Array.from({ length: 31 }, (_, i) => i + 1);
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const curYear = new Date().getFullYear();
-  const years = Array.from({ length: 6 }, (_, i) => curYear + i);
-  const hours = Array.from({ length: 24 }, (_, i) => i);
-  const mins = Array.from({ length: 60 }, (_, i) => i);
+  // Start from the caller's current value every time the sheet opens, so a
+  // cancelled edit (or a value changed elsewhere) never shows stale numbers.
+  useEffect(() => {
+    if (visible) setD(initial ? new Date(initial) : new Date());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
 
+  const year = d.getFullYear();
+  const month = d.getMonth();
+  const dim = daysInMonth(year, month);
+  const days = Array.from({ length: dim }, (_, i) => String(i + 1));
+  const curYear = new Date().getFullYear();
+  const firstYear = Math.min(curYear, year);
+  const years = Array.from({ length: curYear + 6 - firstYear }, (_, i) => String(firstYear + i));
+  const hours = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, "0"));
+  const mins = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, "0"));
+
+  // Rebuild the date in one go and clamp the day, so 31 Jan -> Feb gives 28/29 Feb
+  // instead of rolling over into March.
   const set = (patch: Partial<{ day: number; month: number; year: number; hour: number; minute: number }>) => {
-    const nd = new Date(d);
-    if (patch.year !== undefined) nd.setFullYear(patch.year);
-    if (patch.month !== undefined) nd.setMonth(patch.month);
-    if (patch.day !== undefined) nd.setDate(patch.day);
-    if (patch.hour !== undefined) nd.setHours(patch.hour);
-    if (patch.minute !== undefined) nd.setMinutes(patch.minute);
-    setD(nd);
+    setD((prev) => {
+      const y = patch.year ?? prev.getFullYear();
+      const m = patch.month ?? prev.getMonth();
+      const day = Math.min(patch.day ?? prev.getDate(), daysInMonth(y, m));
+      const h = patch.hour ?? prev.getHours();
+      const min = patch.minute ?? prev.getMinutes();
+      return new Date(y, m, day, h, min, 0, 0);
+    });
   };
 
   return (
@@ -53,18 +80,21 @@ export function PickerSheet({ visible, initial, mode, onClose, onConfirm }: Prop
             <View style={{ width: 50 }} />
           </View>
 
-          {mode === "date" ? (
-            <View style={styles.row}>
-              <Wheel label="Day" items={days.map(String)} value={String(d.getDate())} onChange={(v) => set({ day: Number(v) })} />
-              <Wheel label="Month" items={months} value={months[d.getMonth()]} onChange={(v) => set({ month: months.indexOf(v) })} />
-              <Wheel label="Year" items={years.map(String)} value={String(d.getFullYear())} onChange={(v) => set({ year: Number(v) })} />
-            </View>
-          ) : (
-            <View style={styles.row}>
-              <Wheel label="Hour" items={hours.map((x) => String(x).padStart(2, "0"))} value={String(d.getHours()).padStart(2, "0")} onChange={(v) => set({ hour: Number(v) })} />
-              <Wheel label="Min" items={mins.map((x) => String(x).padStart(2, "0"))} value={String(d.getMinutes()).padStart(2, "0")} onChange={(v) => set({ minute: Number(v) })} />
-            </View>
-          )}
+          <View style={styles.row}>
+            <View pointerEvents="none" style={styles.selectionBand} />
+            {mode === "date" ? (
+              <>
+                <Wheel label="Day" items={days} value={String(d.getDate())} onChange={(v) => set({ day: Number(v) })} />
+                <Wheel label="Month" items={MONTHS} value={MONTHS[month]} onChange={(v) => set({ month: MONTHS.indexOf(v) })} />
+                <Wheel label="Year" items={years} value={String(year)} onChange={(v) => set({ year: Number(v) })} />
+              </>
+            ) : (
+              <>
+                <Wheel label="Hour" items={hours} value={hours[d.getHours()]} onChange={(v) => set({ hour: Number(v) })} />
+                <Wheel label="Min" items={mins} value={mins[d.getMinutes()]} onChange={(v) => set({ minute: Number(v) })} />
+              </>
+            )}
+          </View>
 
           <Button
             label="Confirm"
@@ -92,26 +122,51 @@ function Wheel({
   value: string;
   onChange: (v: string) => void;
 }) {
+  const ref = useRef<ScrollView>(null);
+  const index = Math.max(0, items.indexOf(value));
+  const laidOut = useRef(false);
+
+  // Keep the selected row centered: on first layout jump straight to it, and
+  // follow later changes (a tap, or a day clamped after a month change).
+  useEffect(() => {
+    if (!laidOut.current) return;
+    ref.current?.scrollTo({ y: index * ITEM_H, animated: true });
+  }, [index]);
+
+  const pickFromOffset = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const i = Math.round(e.nativeEvent.contentOffset.y / ITEM_H);
+    const clamped = Math.min(items.length - 1, Math.max(0, i));
+    if (items[clamped] !== value) onChange(items[clamped]);
+  };
+
   return (
     <View style={{ flex: 1, alignItems: "center" }}>
-      <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 8, fontWeight: "600" }}>{label}</Text>
+      <Text style={styles.wheelLabel} allowFontScaling={false}>{label}</Text>
       <ScrollView
+        ref={ref}
         showsVerticalScrollIndicator={false}
-        style={{ height: 180, width: "100%" }}
-        contentContainerStyle={{ paddingVertical: 70 }}
+        style={{ height: WHEEL_H, width: "100%" }}
+        contentContainerStyle={{ paddingVertical: WHEEL_PAD }}
+        snapToInterval={ITEM_H}
+        decelerationRate="fast"
+        nestedScrollEnabled
+        onLayout={() => {
+          ref.current?.scrollTo({ y: index * ITEM_H, animated: false });
+          laidOut.current = true;
+        }}
+        onMomentumScrollEnd={pickFromOffset}
+        onScrollEndDrag={(e) => {
+          // A slow release has no momentum phase on some devices.
+          const v = e.nativeEvent.velocity?.y ?? 0;
+          if (Math.abs(v) < 0.05) pickFromOffset(e);
+        }}
       >
         {items.map((it) => {
           const selected = it === value;
           return (
-            <TouchableOpacity
-              key={it}
-              onPress={() => onChange(it)}
-              style={{
-                paddingVertical: 8,
-                alignItems: "center",
-              }}
-            >
+            <TouchableOpacity key={it} onPress={() => onChange(it)} style={styles.item}>
               <Text
+                allowFontScaling={false}
                 style={{
                   color: selected ? colors.primary : colors.textMuted,
                   fontSize: selected ? 22 : 16,
@@ -151,4 +206,16 @@ const styles = StyleSheet.create({
   headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: spacing.md },
   title: { fontSize: 17, fontWeight: "700", color: colors.text },
   row: { flexDirection: "row", backgroundColor: colors.background, borderRadius: radius.lg, padding: 10 },
+  wheelLabel: { color: colors.textMuted, fontSize: 12, marginBottom: 8, fontWeight: "600", height: 16 },
+  item: { height: ITEM_H, alignItems: "center", justifyContent: "center" },
+  // Sits behind the centered row of every wheel: label (16) + gap (8) + top padding.
+  selectionBand: {
+    position: "absolute",
+    left: 10,
+    right: 10,
+    top: 10 + 16 + 8 + WHEEL_PAD,
+    height: ITEM_H,
+    borderRadius: radius.md,
+    backgroundColor: colors.primaryTint,
+  },
 });

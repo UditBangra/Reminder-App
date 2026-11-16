@@ -1,6 +1,7 @@
 import { Stack } from "expo-router";
 import { AuthProvider } from "../src/auth";
 import { BillingProvider } from "../src/billing";
+import { NotificationTaps } from "../src/NotificationTaps";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 
@@ -17,6 +18,7 @@ export default function RootLayout() {
               animation: "slide_from_right",
             }}
           />
+          <NotificationTaps />
         </BillingProvider>
       </AuthProvider>
     </SafeAreaProvider>

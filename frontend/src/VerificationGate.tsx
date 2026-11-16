@@ -59,6 +59,7 @@ export function VerifyModal({
   initialEmail,
   onClose,
   onVerified,
+  onSkip,
 }: {
   visible: boolean;
   mode: Mode;
@@ -68,6 +69,8 @@ export function VerifyModal({
   initialEmail?: string;
   onClose: () => void;
   onVerified: () => void;
+  /** Mandatory gate only: offered after the code couldn't be sent, so an SMS/email outage never locks people out. */
+  onSkip?: () => void;
 }) {
   const [cc, setCc] = useState(initialCc || "+91");
   const [phone, setPhone] = useState(phoneDigits(initialPhone || ""));
@@ -78,6 +81,7 @@ export function VerifyModal({
   const [verifying, setVerifying] = useState(false);
   const [err, setErr] = useState("");
   const [cooldown, setCooldown] = useState(0);
+  const [sendFailed, setSendFailed] = useState(false);
 
   useEffect(() => {
     if (cooldown <= 0) return;
@@ -110,6 +114,8 @@ export function VerifyModal({
       setCooldown(60);
     } catch (e: any) {
       setErr(e.message || "Failed to send code.");
+      // Our side (or the SMS/email provider) failed, not the user's input.
+      if (!e?.status || e.status >= 500) setSendFailed(true);
     } finally {
       setSending(false);
     }
@@ -232,6 +238,11 @@ export function VerifyModal({
               <Text style={{ color: colors.textMuted, fontSize: 14 }}>Cancel</Text>
             </TouchableOpacity>
           )}
+          {!dismissible && onSkip && sendFailed && (
+            <TouchableOpacity onPress={onSkip} style={{ marginTop: 14, alignItems: "center" }} testID="verify-skip">
+              <Text style={{ color: colors.textMuted, fontSize: 14 }}>Verify later</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     </Modal>
@@ -239,15 +250,19 @@ export function VerifyModal({
 }
 
 /* ---------- Mandatory gate, driven by account age + verified flags ---------- */
+// "Verify later" lasts until the app is restarted.
+let skippedThisSession: Mode | null = null;
+
 export function VerificationGate() {
   const { user, refresh } = useAuth();
+  const [, force] = useState(0);
   if (!user) return null;
 
   const days = daysSince(user.created_at);
   const needPhone = !user.phone_verified && days >= 3;
   const needEmail = !user.email_verified && days >= 6;
   const mode: Mode | null = needPhone ? "phone" : needEmail ? "email" : null;
-  if (!mode) return null;
+  if (!mode || skippedThisSession === mode) return null;
 
   return (
     <VerifyModal
@@ -260,6 +275,7 @@ export function VerificationGate() {
       initialEmail={user.email}
       onClose={() => {}}
       onVerified={() => { refresh(); }}
+      onSkip={() => { skippedThisSession = mode; force((n) => n + 1); }}
     />
   );
 }
