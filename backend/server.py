@@ -359,7 +359,38 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    await _touch_last_active(user)
     return user
+
+
+LAST_ACTIVE_EVERY = timedelta(minutes=10)
+
+
+def _parse_dt(v) -> Optional[datetime]:
+    """Stored timestamps are ISO strings (a few old ones are datetimes); always UTC-aware."""
+    if isinstance(v, datetime):
+        dt = v
+    elif isinstance(v, str) and v:
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+async def _touch_last_active(user: dict) -> None:
+    """Remember when the user last used the app or web (any authenticated request),
+    written at most every 10 minutes so busy sessions don't cost a write each call."""
+    now = datetime.now(timezone.utc)
+    prev = _parse_dt(user.get("last_active_at"))
+    if prev is not None and now - prev < LAST_ACTIVE_EVERY:
+        return
+    try:
+        await db.users.update_one({"id": user["id"]}, {"$set": {"last_active_at": now.isoformat()}})
+    except Exception as e:
+        logger.debug("[auth] last_active update failed: %s", e)
 
 
 # ---------------- Senders (all graceful) ----------------
@@ -802,6 +833,7 @@ async def _grant_credits(
     pack_id: Optional[str] = None,
     note: Optional[str] = None,
     provider: Optional[str] = None,
+    test: bool = False,
 ) -> bool:
     """Add credits exactly once per idempotency key. Returns False if this key was
     already applied (a webhook retry, or the app and the webhook both reporting
@@ -818,6 +850,9 @@ async def _grant_credits(
             "pack_id": pack_id,
             "provider": provider,
             "note": note,
+            # Store sandbox purchase (testers, App Review): credited so the flow can be
+            # tested end to end, but kept out of revenue and labelled in the admin.
+            "test": test,
             "idempotency_key": key,
             "created_at": now,
         })
@@ -1279,13 +1314,23 @@ async def _fire_reminder(reminder_id: str) -> None:
         existing.update(pending_for_others)
         update["pending_channels"] = sorted(existing)
 
+    delivered = _delivered_channels(results)
     log_entry = {
         "id": str(uuid.uuid4()),
         "reminder_id": reminder_id,
+        "user_id": r.get("user_id"),
         "fired_at": now,
         "results": results,
+        "delivered": delivered,
     }
     await db.reminder_logs.insert_one(log_entry)
+    if delivered and r.get("user_id"):
+        # Lifetime send stats for the admin: one occurrence counts once however many
+        # channels it went out on; the per-channel counters show the breakup.
+        try:
+            await db.users.update_one({"id": r["user_id"]}, {"$inc": _send_stats_inc(delivered)})
+        except Exception as e:
+            logger.warning("[fire] send stats update failed: %s", e)
 
     # Complete when repeats are exhausted AND nothing is awaiting manual send.
     # - self: no pending channels, so completes once repeats run out.
@@ -1320,6 +1365,52 @@ async def _fire_reminder(reminder_id: str) -> None:
             )
     except Exception as e:
         logger.debug("[ws] broadcast reminder.fired failed: %s", e)
+
+
+SEND_CHANNELS = ("push", "whatsapp", "sms", "email")
+
+
+def _delivered_channels(results: dict) -> list[str]:
+    """Channels that actually went out for one occurrence. Result keys are the channel
+    plus an optional role suffix (push_other, sms_creator, ...); only a literal True
+    means sent (push_other_match_count is a number, skipped_no_credits a list)."""
+    out = set()
+    for k, v in (results or {}).items():
+        if v is True:
+            base = str(k).split("_", 1)[0]
+            if base in SEND_CHANNELS:
+                out.add(base)
+    return sorted(out)
+
+
+def _send_stats_inc(channels: list[str]) -> dict:
+    inc = {"sent_total": 1}
+    for ch in channels:
+        inc[f"sent_by_channel.{ch}"] = 1
+    return inc
+
+
+async def _backfill_send_stats() -> None:
+    """One-time: build the per-user send counters from the reminder logs that existed
+    before the counters did. Runs before the scheduler starts, so no new fires can
+    be counted twice; the app_meta marker makes it run only once ever."""
+    try:
+        await db.app_meta.insert_one({"id": "send_stats_v1", "at": datetime.now(timezone.utc).isoformat()})
+    except DuplicateKeyError:
+        return
+    owners = {r["id"]: r.get("user_id") async for r in db.reminders.find({}, {"_id": 0, "id": 1, "user_id": 1})}
+    totals: dict[str, dict] = {}
+    async for log in db.reminder_logs.find({}, {"_id": 0, "reminder_id": 1, "user_id": 1, "results": 1}):
+        uid = log.get("user_id") or owners.get(log.get("reminder_id"))
+        chans = _delivered_channels(log.get("results") or {})
+        if not uid or not chans:
+            continue
+        acc = totals.setdefault(uid, {})
+        for k, v in _send_stats_inc(chans).items():
+            acc[k] = acc.get(k, 0) + v
+    for uid, inc in totals.items():
+        await db.users.update_one({"id": uid}, {"$inc": inc})
+    logger.info("[stats] send counters backfilled for %d users", len(totals))
 
 
 async def _migrate_existing_users_to_credits() -> None:
@@ -1381,7 +1472,10 @@ async def lifespan(app: FastAPI):
     await db.email_campaigns.create_index("created_at")
     # A restart kills any in-flight broadcast; mark it so it doesn't block new sends.
     await db.email_campaigns.update_many({"status": "sending"}, {"$set": {"status": "interrupted"}})
+    await db.app_meta.create_index("id", unique=True)
+    await db.reminder_logs.create_index("reminder_id")
     await _migrate_existing_users_to_credits()
+    await _backfill_send_stats()
     scheduler.start()
     # reschedule all active reminders
     async for r in db.reminders.find({"status": {"$in": ["pending", "active"]}}, {"_id": 0}):
@@ -2685,6 +2779,7 @@ async def _credit_purchase(
 ) -> bool:
     """Credit a paid pack once per provider transaction and record the payment."""
     pack = PACKS[pack_id]
+    is_test = (environment or "").upper() == "SANDBOX"
     granted = await _grant_credits(
         user_id,
         pack["credits"] * 10,
@@ -2692,7 +2787,8 @@ async def _credit_purchase(
         key=f"pay:{provider}:{ref}",
         pack_id=pack_id,
         provider=provider,
-        note=f"{pack['name']} pack",
+        note=f"{pack['name']} pack" + (" (test purchase)" if is_test else ""),
+        test=is_test,
     )
     now = datetime.now(timezone.utc).isoformat()
     sets = {"user_id": user_id, "pack_id": pack_id, "credits": pack["credits"], "status": "paid"}
@@ -3105,7 +3201,7 @@ async def admin_billing_users(q: str = "", x_admin_key: Optional[str] = Header(N
     docs, revenue, paying_users = await asyncio.gather(
         db.users.find(query, projection).sort("created_at", -1).limit(25).to_list(25),
         db.payments.aggregate([
-            {"$match": {"status": "paid"}},
+            {"$match": {"status": "paid", "environment": {"$ne": "SANDBOX"}}},
             {"$group": {"_id": "$currency", "amount": {"$sum": "$amount"}, "count": {"$sum": 1}}},
         ]).to_list(20),
         db.users.count_documents({"credits_tenths": {"$gt": 0}}),
@@ -3137,11 +3233,352 @@ async def admin_grant_credits(uid: str, body: AdminCreditGrantIn, x_admin_key: O
     return _admin_user_row(u)
 
 
+@api.post("/admin/billing/users/{uid}/deduct")
+async def admin_deduct_credits(uid: str, body: AdminCreditGrantIn, x_admin_key: Optional[str] = Header(None)):
+    """Take credits back by hand (e.g. test-purchase credits on a real account).
+    Never takes the balance below zero."""
+    _require_admin(x_admin_key)
+    u = await db.users.find_one({"id": uid}, {"_id": 0, "credits_tenths": 1})
+    if not u:
+        raise HTTPException(404, "User not found")
+    take = min(_credits_tenths(u), int(round(body.credits * 10)))
+    if take <= 0:
+        raise HTTPException(400, "This user has no credits to remove.")
+    await _grant_credits(
+        uid,
+        -take,
+        kind="admin",
+        key=f"admin:{uuid.uuid4()}",
+        note=(body.note or "").strip() or "Removed by Rymind support",
+    )
+    u = await db.users.find_one({"id": uid}, {"_id": 0})
+    return _admin_user_row(u)
+
+
+# ------- Admin: users summary -------
+def _iso(v) -> Optional[str]:
+    dt = _parse_dt(v)
+    return dt.isoformat() if dt else None
+
+
+async def _admin_users_dataset() -> list[dict]:
+    """One row per user with credits, billing, reminder and send stats. Built from a
+    handful of grouped aggregations (not one query per user), so it stays fast
+    with thousands of accounts."""
+    projection = {"_id": 0, "id": 1, "full_name": 1, "email": 1, "phone_full": 1, "country_code": 1,
+                  "plan": 1, "credits_tenths": 1, "welcome_gift_at": 1, "created_at": 1,
+                  "last_login_at": 1, "last_active_at": 1, "sent_total": 1, "sent_by_channel": 1,
+                  "marketing_consent": 1}
+    users, rem_stats, ledger_stats, pay_stats = await asyncio.gather(
+        db.users.find({}, projection).to_list(None),
+        db.reminders.aggregate([
+            {"$group": {
+                "_id": "$user_id",
+                "total": {"$sum": 1},
+                "active": {"$sum": {"$cond": [{"$in": ["$status", ["pending", "active"]]}, 1, 0]}},
+            }},
+        ]).to_list(None),
+        db.credit_ledger.aggregate([
+            {"$group": {
+                "_id": "$user_id",
+                "received": {"$sum": {"$cond": [
+                    {"$and": [{"$gt": ["$delta_tenths", 0]}, {"$in": ["$kind", ["purchase", "gift", "admin"]]}]},
+                    "$delta_tenths", 0]}},
+                "test_received": {"$sum": {"$cond": [
+                    {"$and": [{"$gt": ["$delta_tenths", 0]}, {"$eq": ["$test", True]}]}, "$delta_tenths", 0]}},
+                "used": {"$sum": {"$cond": [{"$eq": ["$kind", "usage"]}, "$delta_tenths", 0]}},
+                "removed": {"$sum": {"$cond": [
+                    {"$and": [{"$lt": ["$delta_tenths", 0]}, {"$ne": ["$kind", "usage"]}]}, "$delta_tenths", 0]}},
+                "kinds": {"$addToSet": {"$cond": [{"$gt": ["$delta_tenths", 0]}, "$kind", None]}},
+            }},
+        ]).to_list(None),
+        db.payments.aggregate([
+            {"$match": {"status": "paid"}},
+            {"$group": {
+                "_id": {"u": "$user_id", "test": {"$eq": ["$environment", "SANDBOX"]}, "cur": "$currency"},
+                "amount": {"$sum": {"$ifNull": ["$amount", 0]}},
+                "count": {"$sum": 1},
+                "last": {"$max": "$paid_at"},
+                "stores": {"$addToSet": "$store"},
+                "providers": {"$addToSet": "$provider"},
+            }},
+        ]).to_list(None),
+    )
+    rems = {d["_id"]: d for d in rem_stats}
+    ledger = {d["_id"]: d for d in ledger_stats}
+    pays: dict[str, dict] = {}
+    for d in pay_stats:
+        key = d["_id"]
+        p = pays.setdefault(key.get("u"), {"paid_count": 0, "test_count": 0, "amounts": {}, "last": None, "sources": set()})
+        if key.get("test"):
+            p["test_count"] += d["count"]
+            continue
+        p["paid_count"] += d["count"]
+        cur = key.get("cur")
+        if cur:
+            p["amounts"][cur] = round(p["amounts"].get(cur, 0) + (d.get("amount") or 0), 2)
+        if d.get("last") and (p["last"] is None or str(d["last"]) > str(p["last"])):
+            p["last"] = d["last"]
+        for s in (d.get("stores") or []) + (d.get("providers") or []):
+            if s and s != "revenuecat":
+                p["sources"].add(str(s))
+
+    rows = []
+    for u in users:
+        uid = u.get("id")
+        r = rems.get(uid, {})
+        lg = ledger.get(uid, {})
+        p = pays.get(uid, {"paid_count": 0, "test_count": 0, "amounts": {}, "last": None, "sources": set()})
+        login = _parse_dt(u.get("last_login_at"))
+        active = _parse_dt(u.get("last_active_at"))
+        seen = max([x for x in (login, active) if x], default=None)
+        by_ch = u.get("sent_by_channel") or {}
+        kinds = sorted(k for k in (lg.get("kinds") or []) if k)
+        rows.append({
+            "id": uid,
+            "full_name": u.get("full_name") or "",
+            "email": u.get("email") or "",
+            "phone_full": u.get("phone_full") or "",
+            "country_code": u.get("country_code") or "",
+            "signup_at": _iso(u.get("created_at")),
+            "last_login_at": login.isoformat() if login else None,
+            "last_seen_at": seen.isoformat() if seen else None,
+            "plan": _effective_plan(u),
+            "credits_remaining": _tenths_to_credits(_credits_tenths(u)),
+            "credits_received": _tenths_to_credits(int(lg.get("received") or 0)),
+            "credits_test": _tenths_to_credits(int(lg.get("test_received") or 0)),
+            "credits_used": _tenths_to_credits(-int(lg.get("used") or 0)),
+            "credits_removed": _tenths_to_credits(-int(lg.get("removed") or 0)),
+            "credit_sources": kinds,  # purchase | gift | admin
+            "paid_count": p["paid_count"],
+            "test_purchases": p["test_count"],
+            "amount_paid": [{"currency": c, "amount": a} for c, a in sorted(p["amounts"].items())],
+            "last_paid_at": _iso(p["last"]),
+            "payment_sources": sorted(p["sources"]),
+            "welcome_gift": bool(u.get("welcome_gift_at")),
+            "reminders_active": int(r.get("active") or 0),
+            "reminders_total": int(r.get("total") or 0),
+            "sent_total": int(u.get("sent_total") or 0),
+            "sent_by_channel": {ch: int(by_ch.get(ch) or 0) for ch in SEND_CHANNELS},
+            "marketing_consent": bool(u.get("marketing_consent")),
+        })
+    return rows
+
+
+_USER_SORTS = {
+    "signup": "signup_at", "last_seen": "last_seen_at", "last_login": "last_login_at",
+    "name": "full_name", "email": "email", "plan": "plan",
+    "credits_remaining": "credits_remaining", "credits_used": "credits_used",
+    "credits_received": "credits_received", "paid": "paid_count", "last_paid": "last_paid_at",
+    "reminders_active": "reminders_active", "sent_total": "sent_total",
+}
+
+
+def _filter_user_rows(rows: list[dict], q: str, plan: str, billing: str, activity: str) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    needle = q.strip().lower()
+    digits = re.sub(r"\D", "", needle)
+
+    def keep(row: dict) -> bool:
+        if needle:
+            hay = f"{row['full_name']} {row['email']}".lower()
+            phone = re.sub(r"\D", "", row["phone_full"])
+            if needle not in hay and not (len(digits) >= 3 and digits in phone):
+                return False
+        if plan and plan != "all":
+            if plan == "paid_plans" and row["plan"] == "free":
+                return False
+            if plan != "paid_plans" and row["plan"] != plan:
+                return False
+        if billing == "paying" and row["paid_count"] == 0:
+            return False
+        if billing == "never_paid" and row["paid_count"] > 0:
+            return False
+        if billing == "gift_only" and not (row["welcome_gift"] and row["paid_count"] == 0):
+            return False
+        if billing == "test" and row["test_purchases"] == 0:
+            return False
+        if activity and activity != "all":
+            seen = _parse_dt(row["last_seen_at"])
+            days = (now - seen).days if seen else None
+            if activity == "active_7d" and (days is None or days > 7):
+                return False
+            if activity == "active_30d" and (days is None or days > 30):
+                return False
+            if activity == "inactive_30d" and days is not None and days <= 30:
+                return False
+            if activity == "new_7d":
+                signup = _parse_dt(row["signup_at"])
+                if not signup or (now - signup).days > 7:
+                    return False
+        return True
+
+    return [r for r in rows if keep(r)]
+
+
+def _sort_user_rows(rows: list[dict], sort: str, direction: str) -> list[dict]:
+    field = _USER_SORTS.get(sort, "signup_at")
+    present = [r for r in rows if r.get(field) not in (None, "")]
+    missing = [r for r in rows if r.get(field) in (None, "")]
+    key = (lambda r: str(r[field]).lower()) if isinstance(next((r[field] for r in present), 0), str) else (lambda r: r[field])
+    present.sort(key=key, reverse=direction != "asc")
+    return present + missing  # empty values always last
+
+
+def _users_summary_totals(rows: list[dict]) -> dict:
+    now = datetime.now(timezone.utc)
+
+    def within(v, days):
+        dt = _parse_dt(v)
+        return bool(dt and (now - dt).days <= days)
+
+    revenue: dict[str, float] = {}
+    for r in rows:
+        for a in r["amount_paid"]:
+            revenue[a["currency"]] = round(revenue.get(a["currency"], 0) + a["amount"], 2)
+    plans = {p: 0 for p in ("free", "starter", "popular", "business")}
+    for r in rows:
+        plans[r["plan"]] = plans.get(r["plan"], 0) + 1
+    return {
+        "total_users": len(rows),
+        "new_users_7d": sum(1 for r in rows if within(r["signup_at"], 7)),
+        "active_users_7d": sum(1 for r in rows if within(r["last_seen_at"], 7)),
+        "paying_users": sum(1 for r in rows if r["paid_count"] > 0),
+        "purchases": sum(r["paid_count"] for r in rows),
+        "revenue": [{"currency": c, "amount": a} for c, a in sorted(revenue.items())],
+        "credits_received": round(sum(r["credits_received"] for r in rows), 1),
+        "credits_used": round(sum(r["credits_used"] for r in rows), 1),
+        "credits_remaining": round(sum(r["credits_remaining"] for r in rows), 1),
+        "reminders_active": sum(r["reminders_active"] for r in rows),
+        "sent_total": sum(r["sent_total"] for r in rows),
+        "sent_by_channel": {ch: sum(r["sent_by_channel"][ch] for r in rows) for ch in SEND_CHANNELS},
+        "plans": plans,
+    }
+
+
+def _users_csv(rows: list[dict]) -> str:
+    def esc(v: object) -> str:
+        s = "" if v is None else str(v)
+        if s[:1] in ("=", "+", "-", "@"):
+            s = "'" + s  # keep spreadsheet apps from running cell formulas
+        if any(c in s for c in [',', '"', '\n', '\r']):
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    head = ["Name", "Email", "Mobile", "Signup date", "Last login", "Last seen", "Plan",
+            "Credits received", "Credits used", "Credits remaining", "Test credits",
+            "Purchases", "Amount paid", "Last payment", "Payment source", "Welcome gift",
+            "Active reminders", "Total reminders", "Reminders sent",
+            "Sent: push", "Sent: WhatsApp", "Sent: SMS", "Sent: email"]
+    lines = [",".join(head)]
+    for r in rows:
+        lines.append(",".join(esc(v) for v in (
+            r["full_name"], r["email"], r["phone_full"], r["signup_at"], r["last_login_at"], r["last_seen_at"],
+            r["plan"], r["credits_received"], r["credits_used"], r["credits_remaining"], r["credits_test"],
+            r["paid_count"], " + ".join(f"{a['currency']} {a['amount']}" for a in r["amount_paid"]),
+            r["last_paid_at"], " / ".join(r["payment_sources"]), "yes" if r["welcome_gift"] else "no",
+            r["reminders_active"], r["reminders_total"], r["sent_total"],
+            r["sent_by_channel"]["push"], r["sent_by_channel"]["whatsapp"],
+            r["sent_by_channel"]["sms"], r["sent_by_channel"]["email"],
+        )))
+    return "\r\n".join(lines) + "\r\n"
+
+
+@api.get("/admin/users/summary")
+async def admin_users_summary(
+    q: str = "",
+    plan: str = "all",
+    billing: str = "all",
+    activity: str = "all",
+    sort: str = "signup",
+    direction: Literal["asc", "desc"] = "desc",
+    page: int = 1,
+    page_size: int = 50,
+    format: Literal["json", "csv", "ids"] = "json",
+    x_admin_key: Optional[str] = Header(None),
+):
+    """Superadmin Users table: every user with plan, credits (received / used /
+    remaining), billing, last login, active reminders and reminders sent, plus
+    totals for the summary cards. Filter, sort and page on the server.
+    format=csv downloads the filtered list; format=ids returns just the user ids
+    (used to email everyone matching a filter)."""
+    _require_admin(x_admin_key)
+    rows = await _admin_users_dataset()
+    filtered = _sort_user_rows(_filter_user_rows(rows, q, plan, billing, activity), sort, direction)
+    if format == "csv":
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return Response(
+            content="﻿" + _users_csv(filtered),  # BOM so Excel reads UTF-8 names correctly
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=rymind-users-{stamp}.csv"},
+        )
+    if format == "ids":
+        return {"ids": [r["id"] for r in filtered if r["email"]], "total": len(filtered)}
+    page_size = max(10, min(page_size, 200))
+    pages = max(1, math.ceil(len(filtered) / page_size))
+    page = max(1, min(page, pages))
+    start = (page - 1) * page_size
+    return {
+        "summary": _users_summary_totals(rows),
+        "total": len(filtered),
+        "page": page,
+        "pages": pages,
+        "page_size": page_size,
+        "users": filtered[start:start + page_size],
+    }
+
+
+@api.get("/admin/users/{uid}/ledger")
+async def admin_user_ledger(uid: str, x_admin_key: Optional[str] = Header(None)):
+    """One user's credit history (newest first) and their store/web payments."""
+    _require_admin(x_admin_key)
+    u = await db.users.find_one({"id": uid}, {"_id": 0, "id": 1, "full_name": 1, "email": 1,
+                                              "credits_tenths": 1, "plan": 1})
+    if not u:
+        raise HTTPException(404, "User not found")
+    entries, payments = await asyncio.gather(
+        db.credit_ledger.find({"user_id": uid}, {"_id": 0, "idempotency_key": 0})
+        .sort("created_at", -1).limit(300).to_list(300),
+        db.payments.find({"user_id": uid, "status": {"$in": ["paid", "refunded"]}}, {"_id": 0})
+        .sort("created_at", -1).limit(100).to_list(100),
+    )
+    return {
+        "user": {"id": u["id"], "full_name": u.get("full_name", ""), "email": u.get("email", ""),
+                 "plan": _effective_plan(u), "credits": _tenths_to_credits(_credits_tenths(u))},
+        "entries": [{
+            "id": e.get("id"),
+            "kind": e.get("kind"),
+            "credits": _tenths_to_credits(int(e.get("delta_tenths") or 0)),
+            "balance_after": (_tenths_to_credits(e["balance_after_tenths"])
+                              if e.get("balance_after_tenths") is not None else None),
+            "note": e.get("note"),
+            "channel": e.get("channel"),
+            "reminder_title": e.get("reminder_title"),
+            "target_name": e.get("target_name"),
+            "test": bool(e.get("test")),
+            "created_at": _iso(e.get("created_at")),
+        } for e in entries],
+        "payments": [{
+            "provider": p.get("provider"),
+            "store": p.get("store"),
+            "pack_id": p.get("pack_id"),
+            "credits": p.get("credits"),
+            "amount": p.get("amount"),
+            "currency": p.get("currency"),
+            "status": p.get("status"),
+            "test": p.get("environment") == "SANDBOX",
+            "paid_at": _iso(p.get("paid_at") or p.get("created_at")),
+        } for p in payments],
+    }
+
+
 # ------- Admin: email broadcast -------
 class AdminEmailIn(BaseModel):
     subject: str = Field(..., min_length=1, max_length=150)
     body: str = Field(..., min_length=1, max_length=20000)
-    audience: Literal["all", "marketing"] = "marketing"
+    # "users" = only the accounts in user_ids (picked or filtered in the Users tab).
+    audience: Literal["all", "marketing", "users"] = "marketing"
+    user_ids: Optional[List[str]] = Field(default=None, max_length=20000)
     cta_label: Optional[str] = Field(default=None, max_length=40)
     cta_url: Optional[str] = Field(default=None, max_length=500)
     test_email: Optional[EmailStr] = None
@@ -3265,11 +3702,15 @@ async def admin_send_email(body: AdminEmailIn, x_admin_key: Optional[str] = Head
             raise HTTPException(502, "The test email couldn't be sent. Check the Resend settings and try again.")
         return {"test": True, "sent_to": str(body.test_email)}
 
+    if body.audience == "users" and not body.user_ids:
+        raise HTTPException(400, "Pick at least one user to email.")
     if await db.email_campaigns.find_one({"status": "sending"}, {"_id": 1}):
         raise HTTPException(409, "Another email is still sending. Wait for it to finish first.")
     query: dict = {"email": {"$exists": True, "$ne": ""}}
     if body.audience == "marketing":
         query["marketing_consent"] = True
+    elif body.audience == "users":
+        query["id"] = {"$in": list(dict.fromkeys(body.user_ids or []))}
     seen: set[str] = set()
     recipients = []
     async for u in db.users.find(query, {"_id": 0, "email": 1, "full_name": 1}):
