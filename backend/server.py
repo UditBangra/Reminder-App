@@ -3049,9 +3049,76 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: Optional[str]
     return {"ok": True}
 
 
+# ------- Admin auth -------
+# The web Superadmin panel signs in once with a username + password checked here
+# (ADMIN_USERNAME, default "admin"; ADMIN_PASSWORD, falling back to ADMIN_KEY) and gets
+# a short-lived admin token. Every admin endpoint accepts either that token or the raw
+# ADMIN_KEY in the X-Admin-Key header, so scripts and curl keep working.
+ADMIN_TOKEN_HOURS = 12
+
+
+class AdminLoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=200)
+
+
+def _admin_secrets() -> tuple:
+    admin_key = os.environ.get("ADMIN_KEY") or ""
+    password = os.environ.get("ADMIN_PASSWORD") or admin_key
+    if not admin_key and not password:
+        raise HTTPException(503, "ADMIN_KEY is not configured on the server.")
+    username = (os.environ.get("ADMIN_USERNAME") or "admin").strip().lower()
+    return admin_key, username, password
+
+
+def _admin_key_version(admin_key: str, password: str) -> str:
+    # Changing ADMIN_KEY or ADMIN_PASSWORD in the env signs every admin out.
+    return hashlib.sha256(f"{admin_key}|{password}".encode()).hexdigest()[:16]
+
+
+def _require_admin(x_admin_key: Optional[str]) -> None:
+    """Endpoints that expose PII or take action need the X-Admin-Key header to hold
+    either the ADMIN_KEY secret or an admin token from /admin/login."""
+    admin_key, _, password = _admin_secrets()
+    if not x_admin_key:
+        raise HTTPException(403, "Forbidden")
+    if admin_key and hmac.compare_digest(x_admin_key.encode(), admin_key.encode()):
+        return
+    try:
+        payload = jwt.decode(x_admin_key, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Admin session expired. Please log in again.")
+    except jwt.PyJWTError:
+        raise HTTPException(403, "Forbidden")
+    if payload.get("role") != "admin" or payload.get("kv") != _admin_key_version(admin_key, password):
+        raise HTTPException(401, "Admin session expired. Please log in again.")
+
+
+@api.post("/admin/login")
+async def admin_login(payload: AdminLoginIn, request: Request):
+    admin_key, username, password = _admin_secrets()
+    ip = _client_ip(request)
+    lock_key = "admin-panel"
+    await _check_login_lock(lock_key, ip)
+    user_ok = hmac.compare_digest(payload.username.strip().lower().encode(), username.encode())
+    pass_ok = hmac.compare_digest(payload.password.encode(), password.encode())
+    if not (user_ok and pass_ok):
+        await _record_login_failure(lock_key, ip)
+        raise HTTPException(401, "Invalid admin credentials.")
+    await db.login_failures.delete_many({"email": lock_key})
+    exp = datetime.now(timezone.utc) + timedelta(hours=ADMIN_TOKEN_HOURS)
+    token = jwt.encode(
+        {"sub": "admin", "role": "admin", "kv": _admin_key_version(admin_key, password),
+         "exp": exp, "iat": datetime.now(timezone.utc)},
+        JWT_SECRET, algorithm=JWT_ALG,
+    )
+    return {"token": token, "expires_at": exp.isoformat()}
+
+
 # ------- Admin Analytics -------
 @api.get("/admin/analytics")
-async def get_admin_analytics():
+async def get_admin_analytics(x_admin_key: Optional[str] = Header(None)):
+    _require_admin(x_admin_key)
     # These queries are independent — run them concurrently instead of sequentially
     # (was ~8 round-trips back-to-back; now a single batch).
     (
@@ -3098,10 +3165,10 @@ async def get_admin_analytics():
 
 
 @api.get("/admin/user-activity")
-async def get_admin_user_activity():
+async def get_admin_user_activity(x_admin_key: Optional[str] = Header(None)):
     """Every reminder created across all users (newest first) with creator name/email
-    and its selected delivery channels. Temporary internal monitoring tool, behind the
-    obfuscated admin URL like /admin/analytics."""
+    and its selected delivery channels. Admin only."""
+    _require_admin(x_admin_key)
     user_docs = await db.users.find(
         {}, {"_id": 0, "id": 1, "full_name": 1, "email": 1}
     ).to_list(5000)
@@ -3116,16 +3183,6 @@ async def get_admin_user_activity():
         out["user_email"] = u.get("email", "")
         items.append(out)
     return {"reminders": items, "total": len(items)}
-
-
-def _require_admin(x_admin_key: Optional[str]) -> None:
-    """Endpoints that expose PII or take action are gated by the ADMIN_KEY secret,
-    sent as the X-Admin-Key header."""
-    admin_key = os.environ.get("ADMIN_KEY")
-    if not admin_key:
-        raise HTTPException(503, "ADMIN_KEY is not configured on the server.")
-    if not x_admin_key or not hmac.compare_digest(x_admin_key, admin_key):
-        raise HTTPException(403, "Forbidden")
 
 
 @api.get("/admin/marketing-emails")
@@ -3594,7 +3651,7 @@ def _render_admin_email_body(text: str, first_name: str) -> str:
     safe = html_lib.escape(text.replace("{name}", first_name))
     safe = _URL_RE.sub(lambda m: f'<a href="{m.group(1)}" style="color:#2A4B41">{m.group(1)}</a>', safe)
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", safe) if p.strip()]
-    return "".join(f'<p style="margin:0 0 14px">{p.replace(chr(10), "<br>")}</p>' for p in paragraphs)
+    return "".join(f'<p style="margin:0 0 14px;overflow-wrap:anywhere;word-break:break-word">{p.replace(chr(10), "<br>")}</p>' for p in paragraphs)
 
 
 def _admin_email_params(campaign: dict, recipient: dict) -> dict:
