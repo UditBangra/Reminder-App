@@ -66,6 +66,8 @@ RESEND_FROM = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 # Base URL of the web app — used for clickable email links (custom app schemes
 # like remindly:// are not clickable in email clients). Override via env if needed.
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "https://www.rymind.in").rstrip("/")
+# Who gets the "New purchase" email for every real (non-test) pack sale. Comma-separated.
+PURCHASE_ALERT_EMAILS = [e.strip() for e in os.environ.get("PURCHASE_ALERT_EMAILS", "").split(",") if e.strip()]
 
 # Payments. Mobile purchases go through RevenueCat (App Store / Play billing);
 # web purchases go through Razorpay. Each side stays disabled until its keys are set.
@@ -1476,6 +1478,7 @@ async def lifespan(app: FastAPI):
     await db.reminder_logs.create_index("reminder_id")
     await _migrate_existing_users_to_credits()
     await _backfill_send_stats()
+    _spawn(_send_missed_purchase_alerts())
     scheduler.start()
     # reschedule all active reminders
     async for r in db.reminders.find({"status": {"$in": ["pending", "active"]}}, {"_id": 0}):
@@ -2802,6 +2805,8 @@ async def _credit_purchase(
         {"$set": sets, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}},
         upsert=True,
     )
+    if granted and not is_test:
+        _spawn(_send_purchase_alert(provider, ref, delay=PURCHASE_ALERT_DELAY_SEC))
     return granted
 
 
@@ -2823,6 +2828,101 @@ async def _refund_purchase(provider: str, ref: str) -> None:
         {"provider": provider, "provider_ref": ref},
         {"$set": {"status": "refunded", "refunded_at": datetime.now(timezone.utc).isoformat()}},
     )
+
+
+# --- "New purchase" email to the business owner ---
+# The app's sync usually credits a purchase seconds before RevenueCat's webhook brings
+# the price, so the alert waits a little and then reads the merged payment record.
+PURCHASE_ALERT_DELAY_SEC = 60
+PURCHASE_ALERT_BACKFILL_DAYS = 14
+_CURRENCY_SIGN = {"EUR": "€", "USD": "$", "INR": "₹", "GBP": "£"}
+_STORE_NAME = {"APP_STORE": "App Store", "PLAY_STORE": "Google Play", "razorpay": "Website (Razorpay)"}
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    task.add_done_callback(lambda t: not t.cancelled() and t.exception() and logger.warning("[task] failed: %s", t.exception()))
+
+
+def _money(amount, currency) -> str:
+    if amount is None:
+        return "Amount not reported yet (see App Store Connect / Play Console)"
+    cur = (currency or "").upper()
+    sign = _CURRENCY_SIGN.get(cur)
+    num = f"{float(amount):,.2f}"
+    return f"{sign}{num}" if sign else f"{num} {cur}".strip()
+
+
+async def _send_purchase_alert(provider: str, ref: str, delay: float = 0) -> bool:
+    """Email PURCHASE_ALERT_EMAILS once about a real pack sale. alert_sent_at on the
+    payment makes it once-only, also across restarts and the startup catch-up."""
+    if not PURCHASE_ALERT_EMAILS or not RESEND_KEY:
+        return False
+    if delay:
+        await asyncio.sleep(delay)
+    now = datetime.now(timezone.utc).isoformat()
+    pay = await db.payments.find_one_and_update(
+        {"provider": provider, "provider_ref": ref, "status": "paid",
+         "environment": {"$ne": "SANDBOX"}, "alert_sent_at": {"$exists": False}},
+        {"$set": {"alert_sent_at": now}},
+        projection={"_id": 0},
+    )
+    if not pay:
+        return False
+    u = await db.users.find_one({"id": pay["user_id"]}, {"_id": 0}) or {}
+    pack = PACKS.get(pay.get("pack_id") or "", {})
+    paid_count = await db.payments.count_documents(
+        {"user_id": pay["user_id"], "status": "paid", "environment": {"$ne": "SANDBOX"}})
+    esc = lambda v: html_lib.escape(str(v)) if v not in (None, "") else "-"
+    when = _parse_dt(pay.get("paid_at") or pay.get("created_at"))
+    rows = [
+        ("Customer", u.get("full_name")),
+        ("Email", u.get("email")),
+        ("Phone", u.get("phone_full")),
+        ("Pack", f"{pack.get('name', pay.get('pack_id'))} ({pay.get('credits', pack.get('credits'))} credits)"),
+        ("Amount paid", _money(pay.get("amount"), pay.get("currency"))),
+        ("Paid through", _STORE_NAME.get(pay.get("store") or provider, pay.get("store") or provider)),
+        ("Date", when.strftime("%d %b %Y, %H:%M UTC") if when else None),
+        ("Balance now", f"{_credits_tenths(u) / 10:g} credits" if u else None),
+        ("Purchases by this user", paid_count),
+    ]
+    table = "".join(
+        f'<tr><td style="padding:6px 12px 6px 0;color:#6B756E;white-space:nowrap;vertical-align:top">{k}</td>'
+        f'<td style="padding:6px 0;color:#1B1F1A;font-weight:600;overflow-wrap:anywhere">{esc(v)}</td></tr>'
+        for k, v in rows
+    )
+    body = (
+        '<p style="margin:0 0 14px">Someone just bought a credit pack in Rymind.</p>'
+        f'<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">{table}</table>'
+        '<p style="margin:0 0 6px;color:#6B756E;font-size:13px">The store pays this out with its monthly payout, '
+        'after its commission and taxes. Test purchases are never emailed.</p>'
+    )
+    name = (u.get("full_name") or "A user").strip()
+    subject = f"New purchase: {name} bought {pack.get('name', 'a')} pack ({_money(pay.get('amount'), pay.get('currency')) if pay.get('amount') is not None else pay.get('credits')})"
+    html = _branded_email_html("New purchase", body, "Open admin panel",
+                               f"{WEB_APP_URL}/jhkuiyiwew/admin/dashboard",
+                               "Sent automatically by Rymind for every real purchase.")
+    ok = False
+    for to in PURCHASE_ALERT_EMAILS:
+        ok = await send_email(to, subject, html) or ok
+    if not ok:  # let a later retry (next restart) try again
+        await db.payments.update_one({"provider": provider, "provider_ref": ref}, {"$unset": {"alert_sent_at": ""}})
+    return ok
+
+
+async def _send_missed_purchase_alerts() -> None:
+    """On startup, email real sales from the last couple of weeks that never got an
+    alert (made before alerts existed, or while email was failing)."""
+    if not PURCHASE_ALERT_EMAILS or not RESEND_KEY:
+        return
+    since = (datetime.now(timezone.utc) - timedelta(days=PURCHASE_ALERT_BACKFILL_DAYS)).isoformat()
+    missed = await db.payments.find(
+        {"status": "paid", "environment": {"$ne": "SANDBOX"}, "alert_sent_at": {"$exists": False},
+         "created_at": {"$gte": since}},
+        {"_id": 0, "provider": 1, "provider_ref": 1},
+    ).sort("created_at", 1).to_list(50)
+    for pay in missed:
+        await _send_purchase_alert(pay["provider"], pay["provider_ref"])
 
 
 # --- Mobile: App Store / Google Play via RevenueCat ---
