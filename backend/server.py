@@ -68,6 +68,11 @@ RESEND_FROM = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "https://www.rymind.in").rstrip("/")
 # Who gets the "New purchase" email for every real (non-test) pack sale. Comma-separated.
 PURCHASE_ALERT_EMAILS = [e.strip() for e in os.environ.get("PURCHASE_ALERT_EMAILS", "").split(",") if e.strip()]
+# Who gets Help & Support messages from the app / web contact form. Comma-separated;
+# falls back to PURCHASE_ALERT_EMAILS. SUPPORT_PUBLIC_EMAIL is the address the app
+# shows users for "email us" (optional; when unset the app shows only the form).
+SUPPORT_EMAILS = [e.strip() for e in os.environ.get("SUPPORT_EMAILS", "").split(",") if e.strip()] or PURCHASE_ALERT_EMAILS
+SUPPORT_PUBLIC_EMAIL = os.environ.get("SUPPORT_PUBLIC_EMAIL", "").strip()
 
 # Payments. Mobile purchases go through RevenueCat (App Store / Play billing);
 # web purchases go through Razorpay. Each side stays disabled until its keys are set.
@@ -349,7 +354,7 @@ def create_access_token(user_id: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
-async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+async def get_current_user(request: Request, authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
@@ -361,6 +366,12 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if payload.get("imp"):
+        # Admin "view as user" session: read-only, and it doesn't count as the
+        # user being active.
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            raise HTTPException(status_code=403, detail="This is a view-only admin session. Changes are disabled.")
+        return user
     await _touch_last_active(user)
     return user
 
@@ -520,7 +531,7 @@ async def send_sms_detailed(to_phone: str, body: str) -> tuple[bool, Optional[in
         return False, code if isinstance(code, int) else None
 
 
-async def send_email(to_email: str, subject: str, html: str) -> bool:
+async def send_email(to_email: str, subject: str, html: str, reply_to: Optional[str] = None) -> bool:
     if not RESEND_KEY:
         logger.info("[email MOCK] to=%s subject=%s", to_email, subject)
         return False
@@ -530,12 +541,15 @@ async def send_email(to_email: str, subject: str, html: str) -> bool:
         resend.api_key = RESEND_KEY
 
         def _send():
-            resend.Emails.send({
+            params = {
                 "from": RESEND_FROM,
                 "to": [to_email],
                 "subject": subject,
                 "html": html,
-            })
+            }
+            if reply_to:
+                params["reply_to"] = reply_to
+            resend.Emails.send(params)
 
         await asyncio.to_thread(_send)
         return True
@@ -557,8 +571,9 @@ PLANS: list[dict] = [
     {
         "id": "free", "name": "Free", "credits": 0, "price_usd": 0, "price_inr": 0,
         "product_id": None, "recommended": False,
-        "tagline": "For individuals trying Rymind",
-        "features": ["App notifications only", f"Up to {FREE_ACTIVE_LIMIT} active reminders"],
+        "tagline": "Free forever for individuals with limited needs.",
+        "features": ["App notifications only", f"Up to {FREE_ACTIVE_LIMIT} active reminders",
+                     "Free signup, no card needed"],
     },
     {
         "id": "starter", "name": "Starter", "credits": 1000, "price_usd": 5.99, "price_inr": 499,
@@ -1476,6 +1491,9 @@ async def lifespan(app: FastAPI):
     await db.email_campaigns.update_many({"status": "sending"}, {"$set": {"status": "interrupted"}})
     await db.app_meta.create_index("id", unique=True)
     await db.reminder_logs.create_index("reminder_id")
+    await db.reminder_logs.create_index("fired_at")
+    await db.support_requests.create_index([("ip", 1), ("created_at", -1)])
+    await db.support_requests.create_index("created_at")
     await _migrate_existing_users_to_credits()
     await _backfill_send_stats()
     _spawn(_send_missed_purchase_alerts())
@@ -3727,6 +3745,376 @@ async def admin_user_ledger(uid: str, x_admin_key: Optional[str] = Header(None))
             "paid_at": _iso(p.get("paid_at") or p.get("created_at")),
         } for p in payments],
     }
+
+
+# ------- Admin: date-range overview and day-wise activity -------
+# Dates are calendar days in the admin's own timezone: the web panel passes its
+# UTC offset in minutes (India = 330, the default), so "today" means today in India
+# and not today in UTC.
+ADMIN_MAX_RANGE_DAYS = 366
+
+
+def _admin_range(start: str, end: str, tz_offset_minutes: int, default_days: int = 1):
+    """-> (tz, start_utc, end_utc_exclusive, start_date, end_date). Empty start/end
+    default to the last `default_days` days ending today (1 = just today)."""
+    if not -14 * 60 <= tz_offset_minutes <= 14 * 60:
+        raise HTTPException(400, "tz_offset_minutes is out of range.")
+    tz = timezone(timedelta(minutes=tz_offset_minutes))
+    today = datetime.now(tz).date()
+
+    def parse(v: str, fallback):
+        if not v:
+            return fallback
+        try:
+            return datetime.strptime(v.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "Dates must look like YYYY-MM-DD.")
+
+    end_d = parse(end, today)
+    start_d = parse(start, end_d - timedelta(days=default_days - 1))
+    if start_d > end_d:
+        raise HTTPException(400, "The start date is after the end date.")
+    if (end_d - start_d).days >= ADMIN_MAX_RANGE_DAYS:
+        raise HTTPException(400, f"Pick a range of at most {ADMIN_MAX_RANGE_DAYS} days.")
+    s = datetime.combine(start_d, datetime.min.time(), tz).astimezone(timezone.utc)
+    e = datetime.combine(end_d + timedelta(days=1), datetime.min.time(), tz).astimezone(timezone.utc)
+    return tz, s, e, start_d, end_d
+
+
+def _in_range(v, s: datetime, e: datetime) -> Optional[datetime]:
+    dt = _parse_dt(v)
+    return dt if dt and s <= dt < e else None
+
+
+def _log_channels(log: dict) -> list[str]:
+    return log.get("delivered") if log.get("delivered") is not None else _delivered_channels(log.get("results") or {})
+
+
+async def _logs_between(s: datetime, e: datetime, projection: dict) -> list[dict]:
+    # fired_at is always written as datetime.now(timezone.utc).isoformat(), so the
+    # ISO strings sort in time order and a string range query is exact.
+    return await db.reminder_logs.find(
+        {"fired_at": {"$gte": s.isoformat(), "$lt": e.isoformat()}}, projection
+    ).to_list(None)
+
+
+@api.get("/admin/overview")
+async def admin_overview(
+    start: str = "",
+    end: str = "",
+    tz_offset_minutes: int = 330,
+    x_admin_key: Optional[str] = Header(None),
+):
+    """Superadmin Overview for a date range (default: today): user registrations
+    with a chart series, reminders sent with the per-channel breakup, reminders
+    created, and the current number of active reminders. A one-day range gives an
+    hourly series; longer ranges give one point per day."""
+    _require_admin(x_admin_key)
+    tz, s, e, start_d, end_d = _admin_range(start, end, tz_offset_minutes)
+    hourly = start_d == end_d
+
+    users, reminders, logs, active_now = await asyncio.gather(
+        db.users.find({}, {"_id": 0, "created_at": 1}).to_list(None),
+        db.reminders.find({}, {"_id": 0, "created_at": 1}).to_list(None),
+        _logs_between(s, e, {"_id": 0, "fired_at": 1, "delivered": 1, "results": 1}),
+        db.reminders.count_documents({"status": {"$in": ["pending", "active"]}}),
+    )
+
+    if hourly:
+        keys = [f"{h:02d}:00" for h in range(24)]
+        bucket = lambda dt: dt.astimezone(tz).strftime("%H:00")
+    else:
+        keys = [(start_d + timedelta(days=i)).isoformat() for i in range((end_d - start_d).days + 1)]
+        bucket = lambda dt: dt.astimezone(tz).date().isoformat()
+
+    reg = {k: 0 for k in keys}
+    for u in users:
+        dt = _in_range(u.get("created_at"), s, e)
+        if dt:
+            reg[bucket(dt)] += 1
+
+    created = sum(1 for r in reminders if _in_range(r.get("created_at"), s, e))
+
+    sent = {k: {"total": 0, **{ch: 0 for ch in SEND_CHANNELS}} for k in keys}
+    by_channel = {ch: 0 for ch in SEND_CHANNELS}
+    total_sent = 0
+    for log in logs:
+        chans = _log_channels(log)
+        dt = _parse_dt(log.get("fired_at"))
+        if not chans or not dt:
+            continue
+        total_sent += 1
+        b = sent[bucket(dt)]
+        b["total"] += 1
+        for ch in chans:
+            if ch in by_channel:
+                by_channel[ch] += 1
+                b[ch] += 1
+
+    return {
+        "range": {"start": start_d.isoformat(), "end": end_d.isoformat(),
+                  "tz_offset_minutes": tz_offset_minutes, "granularity": "hour" if hourly else "day"},
+        "registrations": {"total": sum(reg.values()), "series": [{"bucket": k, "count": reg[k]} for k in keys]},
+        # total = reminder occurrences that went out on at least one channel;
+        # by_channel counts each channel separately (one occurrence can use several).
+        "sent": {"total": total_sent, "by_channel": by_channel,
+                 "series": [{"bucket": k, **sent[k]} for k in keys]},
+        "reminders": {"created": created, "active_now": active_now},
+        "all_time": {"users": len(users), "reminders": len(reminders)},
+    }
+
+
+@api.get("/admin/activity/daily")
+async def admin_activity_daily(
+    start: str = "",
+    end: str = "",
+    tz_offset_minutes: int = 330,
+    x_admin_key: Optional[str] = Header(None),
+):
+    """Activity counts per date (newest first; default: the last 30 days): new users,
+    reminders created, reminders sent and the per-channel breakup. Open a date with
+    /admin/activity/day for the individual rows."""
+    _require_admin(x_admin_key)
+    tz, s, e, start_d, end_d = _admin_range(start, end, tz_offset_minutes, default_days=30)
+    users, reminders, logs = await asyncio.gather(
+        db.users.find({}, {"_id": 0, "created_at": 1}).to_list(None),
+        db.reminders.find({}, {"_id": 0, "created_at": 1}).to_list(None),
+        _logs_between(s, e, {"_id": 0, "fired_at": 1, "delivered": 1, "results": 1}),
+    )
+    days = {
+        (start_d + timedelta(days=i)).isoformat(): {
+            "new_users": 0, "reminders_created": 0, "reminders_sent": 0,
+            "by_channel": {ch: 0 for ch in SEND_CHANNELS},
+        }
+        for i in range((end_d - start_d).days + 1)
+    }
+    day = lambda dt: dt.astimezone(tz).date().isoformat()
+    for u in users:
+        dt = _in_range(u.get("created_at"), s, e)
+        if dt:
+            days[day(dt)]["new_users"] += 1
+    for r in reminders:
+        dt = _in_range(r.get("created_at"), s, e)
+        if dt:
+            days[day(dt)]["reminders_created"] += 1
+    for log in logs:
+        chans = _log_channels(log)
+        dt = _parse_dt(log.get("fired_at"))
+        if not chans or not dt:
+            continue
+        d = days[day(dt)]
+        d["reminders_sent"] += 1
+        for ch in chans:
+            if ch in d["by_channel"]:
+                d["by_channel"][ch] += 1
+    rows = [{"date": k, **v} for k, v in sorted(days.items(), reverse=True)]
+    totals = {
+        "new_users": sum(r["new_users"] for r in rows),
+        "reminders_created": sum(r["reminders_created"] for r in rows),
+        "reminders_sent": sum(r["reminders_sent"] for r in rows),
+        "by_channel": {ch: sum(r["by_channel"][ch] for r in rows) for ch in SEND_CHANNELS},
+    }
+    return {"range": {"start": start_d.isoformat(), "end": end_d.isoformat(),
+                      "tz_offset_minutes": tz_offset_minutes},
+            "totals": totals, "days": rows}
+
+
+@api.get("/admin/activity/day")
+async def admin_activity_day(
+    date: str = "",
+    tz_offset_minutes: int = 330,
+    x_admin_key: Optional[str] = Header(None),
+):
+    """The individual rows behind one date of /admin/activity/daily: reminders
+    created that day, every reminder sent that day (with its channels) and the
+    users who signed up that day."""
+    _require_admin(x_admin_key)
+    tz, s, e, d, _ = _admin_range(date, date, tz_offset_minutes)
+    user_docs, reminders, logs = await asyncio.gather(
+        db.users.find({}, {"_id": 0, "id": 1, "full_name": 1, "email": 1, "phone_full": 1,
+                           "country_code": 1, "created_at": 1}).to_list(None),
+        db.reminders.find({}, {"_id": 0}).to_list(None),
+        _logs_between(s, e, {"_id": 0}),
+    )
+    users = {u.get("id"): u for u in user_docs}
+    rem_by_id = {r.get("id"): r for r in reminders}
+
+    created = []
+    for r in reminders:
+        if _in_range(r.get("created_at"), s, e):
+            u = users.get(r.get("user_id"), {})
+            out = _reminder_to_out(r).model_dump()
+            out["user_name"] = u.get("full_name", "Unknown")
+            out["user_email"] = u.get("email", "")
+            created.append(out)
+    created.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+
+    sends = []
+    for log in logs:
+        chans = _log_channels(log)
+        if not chans:
+            continue
+        r = rem_by_id.get(log.get("reminder_id"), {})
+        uid = log.get("user_id") or r.get("user_id")
+        u = users.get(uid, {})
+        target = r.get("target") or {}
+        sends.append({
+            "id": log.get("id"),
+            "fired_at": log.get("fired_at"),
+            "reminder_id": log.get("reminder_id"),
+            "title": r.get("title") or "(deleted reminder)",
+            "user_id": uid,
+            "user_name": u.get("full_name", "Unknown"),
+            "user_email": u.get("email", ""),
+            "for_self": bool(target.get("is_self", True)),
+            "target_name": target.get("name"),
+            "channels": chans,
+        })
+    sends.sort(key=lambda x: str(x["fired_at"] or ""), reverse=True)
+
+    signups = sorted(
+        ({"id": u.get("id"), "full_name": u.get("full_name", ""), "email": u.get("email", ""),
+          "phone_full": u.get("phone_full"), "country_code": u.get("country_code"),
+          "created_at": _iso(u.get("created_at"))}
+         for u in user_docs if _in_range(u.get("created_at"), s, e)),
+        key=lambda x: x["created_at"] or "", reverse=True,
+    )
+    by_channel = {ch: sum(1 for x in sends if ch in x["channels"]) for ch in SEND_CHANNELS}
+    return {
+        "date": d.isoformat(),
+        "counts": {"new_users": len(signups), "reminders_created": len(created),
+                   "reminders_sent": len(sends), "by_channel": by_channel},
+        "new_users": signups,
+        "reminders_created": created,
+        "reminders_sent": sends,
+    }
+
+
+# ------- Admin: view a user's account -------
+IMPERSONATE_MINUTES = 60
+
+
+@api.post("/admin/users/{uid}/impersonate")
+async def admin_impersonate(uid: str, request: Request, x_admin_key: Optional[str] = Header(None)):
+    """Sign in to a user's account from the Superadmin panel to see exactly what they
+    see (reminders, contacts, history, credits). The token is view-only: every
+    request that would change something is refused, so support can look without
+    touching the account. Expires after an hour; every use is logged."""
+    _require_admin(x_admin_key)
+    u = await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0})
+    if not u:
+        raise HTTPException(404, "User not found")
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=IMPERSONATE_MINUTES)
+    token = jwt.encode({"sub": uid, "imp": True, "exp": exp, "iat": now}, JWT_SECRET, algorithm=JWT_ALG)
+    await db.admin_audit.insert_one({
+        "id": str(uuid.uuid4()), "action": "impersonate", "user_id": uid,
+        "user_email": u.get("email"), "ip": _client_ip(request)[:64], "created_at": now.isoformat(),
+    })
+    return {"access_token": token, "token_type": "bearer", "read_only": True,
+            "expires_at": exp.isoformat(), "user": _user_to_out(u).model_dump()}
+
+
+# ------- Help & Support -------
+SUPPORT_PER_IP_PER_HOUR = 5
+
+
+class SupportIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    email: EmailStr
+    phone: Optional[str] = Field(default=None, max_length=30)
+    topic: Literal["login", "billing", "reminders", "other"] = "other"
+    message: str = Field(..., min_length=5, max_length=5000)
+    source: Literal["app", "web", "website"] = "app"
+    platform: Optional[str] = Field(default=None, max_length=40)
+    app_version: Optional[str] = Field(default=None, max_length=40)
+
+
+_SUPPORT_TOPICS = {"login": "Can't sign in", "billing": "Plans and credits",
+                   "reminders": "Reminders", "other": "Something else"}
+
+
+@api.get("/support/info")
+async def support_info():
+    """What the app's Help screen can show besides the form."""
+    return {"email": SUPPORT_PUBLIC_EMAIL or None, "form_ready": bool(SUPPORT_EMAILS and RESEND_KEY)}
+
+
+@api.post("/support/contact")
+async def support_contact(body: SupportIn, request: Request, authorization: Optional[str] = Header(None)):
+    """Help & Support form. Works signed out (someone who can't log in) and signed in
+    (the account is attached). Saved to support_requests and emailed to
+    SUPPORT_EMAILS with Reply-To set to the sender, so a reply goes straight to them."""
+    ip = _client_ip(request)[:64]
+    now = datetime.now(timezone.utc)
+    recent = await db.support_requests.count_documents(
+        {"ip": ip, "created_at": {"$gte": (now - timedelta(hours=1)).isoformat()}})
+    if recent >= SUPPORT_PER_IP_PER_HOUR:
+        raise HTTPException(429, "You've sent several messages already. Please wait a bit and try again.")
+
+    account = None
+    if authorization and authorization.lower().startswith("bearer "):
+        try:
+            payload = jwt.decode(authorization.split(" ", 1)[1].strip(), JWT_SECRET, algorithms=[JWT_ALG])
+            if not payload.get("imp"):
+                account = await db.users.find_one(
+                    {"id": payload.get("sub")}, {"_id": 0, "id": 1, "full_name": 1, "email": 1, "phone_full": 1})
+        except jwt.PyJWTError:
+            account = None
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": body.name.strip(),
+        "email": str(body.email).lower(),
+        "phone": (body.phone or "").strip() or None,
+        "topic": body.topic,
+        "message": body.message.strip(),
+        "source": body.source,
+        "platform": body.platform,
+        "app_version": body.app_version,
+        "user_id": account.get("id") if account else None,
+        "ip": ip,
+        "status": "new",
+        "created_at": now.isoformat(),
+    }
+    await db.support_requests.insert_one(dict(doc))
+
+    esc = lambda v: html_lib.escape(str(v)) if v not in (None, "") else "-"
+    rows = [
+        ("Name", doc["name"]), ("Email", doc["email"]), ("Phone", doc["phone"]),
+        ("Topic", _SUPPORT_TOPICS.get(doc["topic"])),
+        ("Signed in as", f"{account.get('full_name')} ({account.get('email')})" if account else "Not signed in"),
+        ("Sent from", " / ".join(x for x in (doc["source"], doc["platform"], doc["app_version"]) if x)),
+    ]
+    table = "".join(
+        f'<tr><td style="padding:6px 12px 6px 0;color:#6B756E;white-space:nowrap;vertical-align:top">{k}</td>'
+        f'<td style="padding:6px 0;color:#1B1F1A;font-weight:600;overflow-wrap:anywhere">{esc(v)}</td></tr>'
+        for k, v in rows
+    )
+    message_html = esc(doc["message"]).replace("\n", "<br>")
+    html = _branded_email_html(
+        "New support message",
+        f'<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">{table}</table>'
+        f'<div style="background:#F8F9F7;border-radius:12px;padding:14px 16px;color:#1B1F1A;'
+        f'overflow-wrap:anywhere">{message_html}</div>',
+        None, None, "Reply to this email to answer the user directly.",
+    )
+    subject = f"Rymind support: {_SUPPORT_TOPICS.get(doc['topic'])} - {doc['name']}"
+    delivered = False
+    for to in SUPPORT_EMAILS:
+        delivered = await send_email(to, subject, html, reply_to=doc["email"]) or delivered
+    if not delivered:
+        logger.warning("[support] message %s saved but not emailed (SUPPORT_EMAILS / Resend not set?)", doc["id"])
+    await db.support_requests.update_one({"id": doc["id"]}, {"$set": {"emailed": delivered}})
+    return {"ok": True}
+
+
+@api.get("/admin/support")
+async def admin_support(x_admin_key: Optional[str] = Header(None)):
+    """Latest Help & Support messages, newest first (also emailed when they arrive)."""
+    _require_admin(x_admin_key)
+    docs = await db.support_requests.find({}, {"_id": 0, "ip": 0}).sort("created_at", -1).limit(200).to_list(200)
+    return {"messages": docs}
 
 
 # ------- Admin: email broadcast -------
