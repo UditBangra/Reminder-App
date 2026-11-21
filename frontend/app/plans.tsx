@@ -99,8 +99,8 @@ export default function Plans() {
           </View>
         </View>
 
-        <SectionTitle style={{ marginTop: spacing.lg }}>Credit packs</SectionTitle>
-        <Text style={styles.sectionNote}>One-time purchase. No subscription and nothing renews.</Text>
+        <SectionTitle style={{ marginTop: spacing.lg }}>Plans</SectionTitle>
+        <Text style={styles.sectionNote}>Start free. Credit packs are a one-time purchase: no subscription and nothing renews.</Text>
 
         <View style={{ gap: 12 }}>
           {billing.plans.map((plan) =>
@@ -237,25 +237,32 @@ function PackCard({
 
 function FreeCard({ plan, isCurrent }: { plan: PlanInfo; isCurrent: boolean }) {
   return (
-    <View style={[styles.pack, styles.packFree, isCurrent ? styles.packCurrent : null]}>
+    <View style={[styles.pack, isCurrent ? styles.packCurrent : null]}>
       <View style={styles.packHead}>
         <Text style={styles.packName}>{plan.name}</Text>
-        {isCurrent ? (
-          <View style={[styles.tag, { backgroundColor: colors.primaryTint }]}>
-            <Text style={[styles.tagText, { color: colors.primary }]}>Current plan</Text>
-          </View>
-        ) : null}
+        <View style={[styles.tag, { backgroundColor: colors.primaryTint }]}>
+          {isCurrent ? null : <Ionicons name="heart" size={11} color={colors.primary} style={{ marginRight: 4 }} />}
+          <Text style={[styles.tagText, { color: colors.primary }]}>{isCurrent ? "Current plan" : "Free forever"}</Text>
+        </View>
       </View>
       <Text style={styles.tagline}>{plan.tagline}</Text>
+
+      <View style={styles.priceRow}>
+        <Text style={[styles.price, { color: colors.text }]}>Free</Text>
+        <Text style={[styles.priceCredits, { color: colors.textMuted }]}>forever</Text>
+      </View>
+
       {plan.features.map((f) => (
         <View key={f} style={styles.feature}>
-          <Ionicons name="checkmark" size={16} color={colors.textMuted} style={{ marginTop: 2 }} />
-          <Text style={[styles.featureText, { color: colors.textMuted }]}>{f}</Text>
+          <Ionicons name="checkmark" size={16} color={colors.primary} style={{ marginTop: 2 }} />
+          <Text style={[styles.featureText, { color: colors.text }]}>{f}</Text>
         </View>
       ))}
-      {!isCurrent ? (
-        <Text style={styles.freeNote}>You move back to Free automatically when your credits run out.</Text>
-      ) : null}
+      <Text style={styles.freeNote}>
+        {isCurrent
+          ? "Need WhatsApp, SMS or email reminders? Pick a credit pack below."
+          : "You move back to Free automatically when your credits run out."}
+      </Text>
     </View>
   );
 }
@@ -343,7 +350,6 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.lg + 4,
   },
   packCurrent: { borderColor: colors.primary, borderWidth: 1.5 },
-  packFree: { backgroundColor: colors.surfaceAlt, borderColor: colors.surfaceAlt, paddingVertical: spacing.md + 4 },
   packHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   packName: { fontSize: 20, fontWeight: "800", color: colors.text, letterSpacing: -0.3 },
   tag: {

@@ -12,7 +12,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import { Button, Input } from "../../src/ui";
+import { Button, Input, PromiseBanner } from "../../src/ui";
 import { colors, spacing } from "../../src/theme";
 import { useAuth } from "../../src/auth";
 import { apiFetch } from "../../src/api";
@@ -74,6 +74,7 @@ export default function Login() {
           </View>
           <Text style={styles.h1}>Welcome back</Text>
           <Text style={styles.sub}>Sign in to keep your commitments on track.</Text>
+          <PromiseBanner />
 
           <View style={{ marginTop: spacing.xl }}>
             <Input
@@ -107,6 +108,16 @@ export default function Login() {
           >
             <Text style={styles.link}>
               New here? <Text style={{ color: colors.primary, fontWeight: "700" }}>Create account</Text>
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => router.push("/support")}
+            style={{ alignItems: "center", marginTop: spacing.md }}
+            testID="login-to-support"
+          >
+            <Text style={styles.link}>
+              Trouble signing in? <Text style={{ color: colors.primary, fontWeight: "700" }}>Contact support</Text>
             </Text>
           </TouchableOpacity>
         </ScrollView>

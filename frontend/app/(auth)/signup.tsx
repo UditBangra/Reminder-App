@@ -13,7 +13,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import { Button, Input } from "../../src/ui";
+import { Button, Input, PromiseBanner } from "../../src/ui";
 import { colors, radius, spacing } from "../../src/theme";
 import { useAuth } from "../../src/auth";
 import { Ionicons } from "@expo/vector-icons";
@@ -68,6 +68,7 @@ export default function Signup() {
           </View>
           <Text style={styles.h1}>Create account</Text>
           <Text style={styles.sub}>A calm, trusted system for all your reminders.</Text>
+          <PromiseBanner />
 
           <View style={{ marginTop: spacing.xl }}>
             <Input label="Full name" placeholder="Your name" value={name} onChangeText={setName} testID="signup-name" />

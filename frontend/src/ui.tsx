@@ -274,3 +274,33 @@ export function Badge({
     </View>
   );
 }
+
+/* ---------- PromiseBanner ---------- */
+// The brand promise shown on sign-in / sign-up, so new users see up front that
+// Rymind is free to start.
+export function PromiseBanner({ style }: { style?: ViewStyle }) {
+  return (
+    <View
+      style={[
+        {
+          backgroundColor: colors.primaryTint,
+          borderRadius: radius.lg,
+          paddingVertical: 14,
+          paddingHorizontal: spacing.md,
+          marginTop: spacing.lg,
+        },
+        style,
+      ]}
+    >
+      <Text style={{ fontSize: 16, fontWeight: "800", color: colors.primary, letterSpacing: -0.2 }}>
+        One Reminder, Every Channel.
+      </Text>
+      {["Free signup, no credit card required", "Free forever for individuals with limited needs"].map((t) => (
+        <View key={t} style={{ flexDirection: "row", alignItems: "flex-start", marginTop: 6 }}>
+          <Ionicons name="checkmark-circle" size={16} color={colors.primary} style={{ marginTop: 1 }} />
+          <Text style={{ flex: 1, marginLeft: 8, fontSize: 13, lineHeight: 18, color: colors.text }}>{t}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}

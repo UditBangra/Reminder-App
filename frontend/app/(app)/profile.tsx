@@ -168,6 +168,15 @@ export default function Profile() {
         </View>
 
         <View style={{ marginTop: spacing.lg }}>
+          <SectionTitle>Help</SectionTitle>
+          <Card>
+            <TouchableOpacity onPress={() => router.push("/support")} activeOpacity={0.7} testID="profile-support">
+              <Row icon="chatbubbles-outline" label="Help and support" value="Contact us" chevron />
+            </TouchableOpacity>
+          </Card>
+        </View>
+
+        <View style={{ marginTop: spacing.lg }}>
           <SectionTitle>Rymind Web</SectionTitle>
           <TouchableOpacity
             activeOpacity={0.85}
